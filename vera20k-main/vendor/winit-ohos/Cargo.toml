@@ -1,0 +1,30 @@
+[package]
+name = "winit-ohos"
+version = "0.30.13"
+edition = "2024"
+publish = false
+description = "winit-compatible window and event layer for OpenHarmony XComponent surfaces"
+
+[lib]
+name = "winit"
+path = "src/lib.rs"
+
+[dependencies]
+
+# The shim's own dependencies only exist on the platform it implements.
+[target.'cfg(target_env = "ohos")'.dependencies]
+raw-window-handle = "0.6.2"
+log = "0.4"
+smol_str = "0.2"
+
+# Every other target sees the official crate through this facade, so the
+# workspace keeps one canonical `winit` dependency (Cargo rejects a name that
+# points at different sources per target). The features are the client's
+# desktop set; winit gates them by target internally.
+[target.'cfg(not(target_env = "ohos"))'.dependencies]
+winit_official = { package = "winit", version = "0.30.13", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen", "wayland-csd-adwaita-notitle"] }
+
+# winit refuses to compile for Android without a backend feature; this adds the
+# NativeActivity backend while the desktop features above stay on.
+[target.'cfg(target_os = "android")'.dependencies]
+winit_official = { package = "winit", version = "0.30.13", default-features = false, features = ["android-native-activity"] }

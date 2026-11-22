@@ -1,0 +1,16 @@
+[package]
+name = "vera20k-ohos"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "OpenHarmony XComponent host for VERA20K"
+
+[lib]
+name = "vera20k_ohos"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+vera20k = { path = "..", default-features = false }
+winit = { package = "winit-ohos", path = "../vendor/winit-ohos" }
+log = "0.4"

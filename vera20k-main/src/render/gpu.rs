@@ -1,0 +1,1082 @@
+//! wgpu device, queue, and surface initialization.
+//!
+//! GpuContext is created once during app startup and lives for the entire session.
+//! It holds all the wgpu state needed for rendering. Other render modules
+//! (sprite.rs, terrain.rs, etc.) borrow device/queue from here.
+//!
+//! ## Why block_on?
+//! wgpu's initialization is async (request_adapter, request_device), but winit's
+//! ApplicationHandler::resumed() is sync. [`block_on`] bridges this gap.
+//!
+//! ## Why Arc<Window>?
+//! wgpu::Surface requires the window to live as long as the surface ('static lifetime).
+//! Wrapping Window in Arc satisfies this because Arc provides 'static ownership.
+//!
+//! ## Dependency rules
+//! - gpu.rs is part of render/ — see render/mod.rs for dependency rules.
+
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::task::{Context as TaskContext, Poll, Wake, Waker};
+
+use anyhow::{Context, Result, bail};
+use winit::event_loop::OwnedDisplayHandle;
+use winit::window::Window;
+
+#[cfg(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))]
+#[path = "web_present.rs"]
+mod web_present;
+
+/// Largest 2D texture edge the renderer will ask for.
+///
+/// Atlases are packed against the requested limit, so this is the real ceiling on how
+/// many pre-rendered sprites fit. 16384 is what current desktop GPUs offer; asking for
+/// more would fail on hardware that could otherwise run the game, and the request is
+/// clamped to the adapter's own maximum anyway.
+pub(crate) const MAX_USEFUL_TEXTURE_DIM: u32 = 16_384;
+
+/// True on the browser's WebGL2 fallback device, which has no storage buffers,
+/// compute or reinterpreting texture views. Renderers that use those select
+/// render-target equivalents there; every other device keeps its ordinary path.
+/// Always false outside the browser build.
+pub(crate) fn webgl_fallback(device: &wgpu::Device) -> bool {
+    #[cfg(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))]
+    {
+        device.limits().max_storage_buffers_per_shader_stage == 0
+    }
+    // Tests can run the fallback's passes on a native device, where the GPU
+    // goldens check them against the storage/compute paths they replace.
+    #[cfg(all(
+        test,
+        not(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))
+    ))]
+    {
+        let _ = device;
+        std::env::var_os("VERA20K_TEST_WEBGL_FALLBACK").is_some_and(|value| value == "1")
+    }
+    #[cfg(not(any(
+        test,
+        all(feature = "wasm", target_arch = "wasm32", target_os = "unknown")
+    )))]
+    {
+        let _ = device;
+        false
+    }
+}
+
+/// One production frame, backed by either the window or its hidden capture target.
+pub struct GpuFrame {
+    pub texture: wgpu::Texture,
+    surface: Option<wgpu::SurfaceTexture>,
+    #[cfg(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))]
+    web_present: Option<Arc<web_present::WebPresent>>,
+}
+
+impl GpuFrame {
+    fn from_surface(surface: wgpu::SurfaceTexture) -> Self {
+        Self {
+            texture: surface.texture.clone(),
+            surface: Some(surface),
+            #[cfg(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))]
+            web_present: None,
+        }
+    }
+
+    /// Hand the acquired surface texture to the queue. wgpu 30 moved
+    /// presentation off `SurfaceTexture`, so the caller passes its queue.
+    pub fn present(self, queue: &wgpu::Queue) {
+        if let Some(surface) = self.surface {
+            #[cfg(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))]
+            if let Some(presenter) = self.web_present {
+                presenter.present(&surface);
+            }
+            queue.present(surface);
+        }
+    }
+}
+
+/// Derived render target for an explicitly hidden diagnostic window.
+struct CaptureTarget {
+    texture: wgpu::Texture,
+}
+
+impl CaptureTarget {
+    fn new(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> Self {
+        Self {
+            texture: device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Hidden Capture Frame"),
+                size: wgpu::Extent3d {
+                    width: config.width,
+                    height: config.height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: config.format,
+                usage: config.usage,
+                view_formats: &config.view_formats,
+            }),
+        }
+    }
+
+    fn resize(&mut self, device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) {
+        *self = Self::new(device, config);
+    }
+
+    fn frame(&self) -> GpuFrame {
+        GpuFrame {
+            texture: self.texture.clone(),
+            surface: None,
+            #[cfg(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))]
+            web_present: None,
+        }
+    }
+}
+
+/// Borrowed, serialization-ready identity of the adapter selected for this GPU
+/// context. This is observation only: it mirrors the immutable `AdapterInfo`
+/// captured during adapter selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GpuAdapterObservation<'a> {
+    pub name: &'a str,
+    pub vendor: u32,
+    pub device: u32,
+    pub device_type: wgpu::DeviceType,
+    pub driver: &'a str,
+    pub driver_info: &'a str,
+    pub backend: wgpu::Backend,
+}
+
+impl<'a> From<&'a wgpu::AdapterInfo> for GpuAdapterObservation<'a> {
+    fn from(info: &'a wgpu::AdapterInfo) -> Self {
+        Self {
+            name: info.name.as_str(),
+            vendor: info.vendor,
+            device: info.device,
+            device_type: info.device_type,
+            driver: info.driver.as_str(),
+            driver_info: info.driver_info.as_str(),
+            backend: info.backend,
+        }
+    }
+}
+
+/// Holds all wgpu state needed for rendering.
+///
+/// Created once during app initialization when the window becomes available.
+/// Other render modules borrow `device` and `queue` from this struct.
+pub struct GpuContext {
+    /// The thread frames reach the driver on. First, so it finishes the frame
+    /// on its way and ends before the surface and device below drop.
+    handoff: super::frame_handoff::FrameHandoff,
+    /// The GPU surface we render to (tied to the window).
+    // Loading progress shares the GPU context with asset uploads. Only this
+    // owner locks the surface, briefly, to acquire or replace a lost swapchain.
+    // Android suspension drops it while retaining the device and game resources.
+    surface: Mutex<Option<wgpu::Surface<'static>>>,
+    instance: wgpu::Instance,
+    window: Arc<Window>,
+    /// The logical GPU device — used to create buffers, textures, pipelines.
+    pub device: wgpu::Device,
+    /// The command queue — used to submit render commands to the GPU.
+    pub queue: super::frame_handoff::HandoffQueue,
+    /// Current surface configuration (format, size, present mode).
+    pub config: wgpu::SurfaceConfiguration,
+    /// The texture format the surface uses (needed when creating pipelines).
+    pub surface_format: wgpu::TextureFormat,
+    /// Exact identity returned by the adapter that backs this context.
+    adapter_info: wgpu::AdapterInfo,
+    capture_target: Option<CaptureTarget>,
+    /// The GPU time of each frame, while the Performance Stats panel shows.
+    pub(crate) timer: super::gpu_timer::GpuTimer,
+    /// VERA's whole-viewport colour-vision filter. Every present path shares
+    /// it, including the synchronous loading repaints outside the frame loop.
+    pub(crate) color_vision: super::color_vision::ColorVisionFilter,
+    #[cfg(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))]
+    web_present: Arc<web_present::WebPresent>,
+}
+
+/// The context of every [`GpuContext::new`] failure: this computer has no
+/// graphics adapter, driver or surface the renderer can use. Startup tells the
+/// player about the graphics driver when it finds this in an error.
+#[derive(Debug)]
+pub struct GraphicsUnavailable;
+
+impl std::fmt::Display for GraphicsUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("No usable graphics adapter or driver")
+    }
+}
+
+impl GpuContext {
+    #[cfg(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))]
+    pub(crate) async fn new_browser(
+        window: Arc<Window>,
+        display: OwnedDisplayHandle,
+    ) -> Result<Self> {
+        Self::new_async(window, display, false).await
+    }
+
+    /// Initialize wgpu with the given window.
+    ///
+    /// This blocks on async wgpu calls using [`block_on`]. Safe to call from
+    /// winit's sync ApplicationHandler::resumed().
+    /// `hidden_capture` is the startup owner's deliberate capture choice, not
+    /// the current visibility/occlusion of a player's ordinary window.
+    pub fn new(
+        window: Arc<Window>,
+        display: OwnedDisplayHandle,
+        hidden_capture: bool,
+    ) -> Result<Self> {
+        block_on(Self::new_async(window, display, hidden_capture)).context(GraphicsUnavailable)
+    }
+
+    /// Async initialization — called by new() via block_on().
+    async fn new_async(
+        window: Arc<Window>,
+        display: OwnedDisplayHandle,
+        hidden_capture: bool,
+    ) -> Result<Self> {
+        // The standard override selects a backend for reproducible
+        // shroud GPU comparisons while retaining primary backends by default.
+        // wgpu requires the display at instance creation for Wayland EGL:
+        // https://docs.rs/wgpu-types/30.0.1/wgpu_types/struct.InstanceDescriptor.html
+        #[cfg(not(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown")))]
+        let instance: wgpu::Instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::PRIMARY.with_env(),
+            ..wgpu::InstanceDescriptor::new_with_display_handle(Box::new(display))
+        });
+        // Browsers without a usable WebGPU adapter fall back to WebGL2. A
+        // surface-less probe with the adapter options used below decides
+        // first: a canvas given a WebGPU context can no longer create WebGL2.
+        // wgpu's own probe (util::is_browser_webgpu_supported) asks with
+        // default options, which can succeed where this request fails.
+        #[cfg(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))]
+        let instance: wgpu::Instance = {
+            let probe = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::BROWSER_WEBGPU,
+                ..wgpu::InstanceDescriptor::new_without_display_handle()
+            });
+            let webgpu = probe
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    compatible_surface: None,
+                    force_fallback_adapter: false,
+                    // wgpu 30 can round reported limits into WebGPU buckets;
+                    // off keeps the probe asking for exact limits as in 29.x.
+                    apply_limit_buckets: false,
+                })
+                .await
+                .is_ok();
+            if !webgpu {
+                log::warn!("WebGPU adapter unavailable; using the WebGL2 fallback");
+            }
+            wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends: if webgpu {
+                    wgpu::Backends::BROWSER_WEBGPU
+                } else {
+                    wgpu::Backends::GL
+                },
+                ..wgpu::InstanceDescriptor::new_with_display_handle(Box::new(display))
+            })
+        };
+
+        // Create the surface from our window. The surface is what we draw pixels to.
+        let surface: wgpu::Surface<'static> = instance
+            .create_surface(window.clone())
+            .context("Failed to create wgpu surface from window")?;
+
+        // Request a GPU adapter (physical device) that can render to our surface.
+        // HighPerformance prefers discrete GPUs over integrated ones.
+        let adapter: wgpu::Adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: false,
+                // wgpu 30 can round the adapter's reported limits down to the
+                // WebGPU bucket it belongs to; off keeps the exact 29.x limits.
+                apply_limit_buckets: false,
+            })
+            .await
+            .context("No suitable GPU adapter found — is a GPU available?")?;
+
+        let adapter_info = adapter.get_info();
+        log::info!(
+            "Using GPU adapter: {} ({:?}, driver {} {})",
+            adapter_info.name,
+            adapter_info.backend,
+            adapter_info.driver,
+            adapter_info.driver_info
+        );
+
+        // Atlas sizing is bounded by whatever limits we *request*, not by the hardware.
+        let adapter_limits = adapter.limits();
+        log::info!(
+            "GPU limits: max_texture_dimension_2d={} (requesting {})",
+            adapter_limits.max_texture_dimension_2d,
+            adapter_limits
+                .max_texture_dimension_2d
+                .min(MAX_USEFUL_TEXTURE_DIM),
+        );
+
+        // Request a logical device and command queue from the adapter.
+        //
+        // `Limits::default()` caps 2D textures at 8192, which is a portability baseline
+        // rather than a hardware one — desktop GPUs commonly do 16384. The unit atlas is
+        // sized against whatever we request here, so asking for the default silently
+        // halved the space available for pre-rendered facings. Ask for what the adapter
+        // actually offers, bounded by what the atlases can use, and fall back
+        // automatically on a device that offers less.
+        let required_limits = wgpu::Limits {
+            max_texture_dimension_2d: adapter_limits
+                .max_texture_dimension_2d
+                .min(MAX_USEFUL_TEXTURE_DIM),
+            ..wgpu::Limits::default()
+        };
+        // WebGL2 has no storage buffers or compute, so the WebGPU baseline is
+        // unattainable; request what the context offers. Renderers detect the
+        // fallback through `webgl_fallback`.
+        #[cfg(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))]
+        let required_limits = if adapter_info.backend == wgpu::Backend::Gl {
+            wgpu::Limits {
+                max_texture_dimension_2d: required_limits.max_texture_dimension_2d,
+                ..adapter_limits.clone()
+            }
+        } else {
+            required_limits
+        };
+        let (device, queue): (wgpu::Device, wgpu::Queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("RA2 Device"),
+                required_features: super::gpu_timer::GpuTimer::features(&adapter),
+                required_limits,
+                ..Default::default()
+            })
+            .await
+            .context("Failed to create wgpu device")?;
+        #[cfg(not(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown")))]
+        watch_device_loss(&device);
+
+        // Pick the best texture format for the surface.
+        // This is usually Bgra8UnormSrgb on Windows, Bgra8Unorm on some other platforms.
+        let surface_caps: wgpu::SurfaceCapabilities = surface.get_capabilities(&adapter);
+        #[cfg(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))]
+        let required_surface_usages = wgpu::TextureUsages::RENDER_ATTACHMENT;
+        #[cfg(not(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown")))]
+        let required_surface_usages = wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::COPY_DST;
+        if !surface_caps.usages.contains(required_surface_usages) {
+            bail!(
+                "exact stock-shell presentation requires surface usages \
+                 {required_surface_usages:?}, adapter exposes {:?}",
+                surface_caps.usages
+            );
+        }
+        let downlevel = adapter.get_downlevel_capabilities();
+        // The WebGL2 fallback replaces both requirements below with
+        // render-target equivalents; see `webgl_fallback`.
+        #[cfg(not(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown")))]
+        let webgl = false;
+        #[cfg(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))]
+        let webgl = adapter_info.backend == wgpu::Backend::Gl;
+        if !webgl && !downlevel.flags.contains(wgpu::DownlevelFlags::VIEW_FORMATS) {
+            bail!(
+                "exact stock-shell presentation requires compatible sRGB/unorm \
+                 texture views, adapter downlevel flags are {:?}",
+                downlevel.flags
+            );
+        }
+        // The packed sprite resolve reads its compute results through a
+        // writable storage binding (terrain_packed.rs). Reject an insufficient
+        // downlevel adapter here rather than panicking later during bind group
+        // layout validation.
+        if !webgl
+            && !downlevel
+                .flags
+                .contains(wgpu::DownlevelFlags::FRAGMENT_WRITABLE_STORAGE)
+        {
+            bail!(
+                "native sprite drawing requires fragment-writable storage, \
+                 adapter downlevel flags are {:?}",
+                downlevel.flags
+            );
+        }
+        // The packed sprite stencil and its destination snapshot share a pass
+        // with per-attachment write masks (terrain_packed.rs).
+        if !webgl
+            && !downlevel
+                .flags
+                .contains(wgpu::DownlevelFlags::INDEPENDENT_BLEND)
+        {
+            bail!(
+                "native sprite drawing requires per-attachment write masks, \
+                 adapter downlevel flags are {:?}",
+                downlevel.flags
+            );
+        }
+        let surface_format: wgpu::TextureFormat = surface_caps
+            .formats
+            .iter()
+            .find(|f| f.is_srgb())
+            .copied()
+            .unwrap_or(surface_caps.formats[0]);
+
+        // Configure the surface with our chosen format and the window's current size.
+        let window_size: winit::dpi::PhysicalSize<u32> = window.inner_size();
+        let (present_mode, desired_maximum_frame_latency) = present_settings(true);
+        let config: wgpu::SurfaceConfiguration = wgpu::SurfaceConfiguration {
+            usage: required_surface_usages,
+            format: surface_format,
+            width: window_size.width.max(1), // wgpu panics on 0-sized surfaces
+            height: window_size.height.max(1),
+            // `App::sync_present_mode` applies the Options page's VSync box
+            // once the profile is loaded.
+            present_mode,
+            alpha_mode: surface_caps.alpha_modes[0],
+            view_formats: vec![],
+            desired_maximum_frame_latency,
+            // wgpu 30 selects an HDR colour space per surface format; Auto keeps
+            // the pre-30 sRGB behaviour for every desktop and WebGL2 backend.
+            color_space: wgpu::SurfaceColorSpace::Auto,
+        };
+        surface.configure(&device, &config);
+        #[cfg(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))]
+        let web_present = Arc::new(web_present::WebPresent::new(&device, &queue, &config));
+        #[cfg(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))]
+        let surface_format = surface_format.add_srgb_suffix();
+        // wgpu-hal 30.0.1 Metal acquire_texture returns SurfaceError::Occluded
+        // for any macOS NSWindow without NSWindowOcclusionStateVisible, including
+        // deliberately hidden captures. Render those frames offscreen with the
+        // same format/usages; the normal render, loading, readback and
+        // capture-driver paths remain shared. Ordinary occluded windows retain
+        // swapchain skip/recovery.
+        // https://docs.rs/wgpu-hal/30.0.1/src/wgpu_hal/metal/surface.rs.html#347-371
+        let capture_target = hidden_capture.then(|| CaptureTarget::new(&device, &config));
+        let timer = super::gpu_timer::GpuTimer::new(&device, &queue);
+
+        log::info!(
+            "GPU initialized: {}x{}, format={:?}",
+            config.width,
+            config.height,
+            surface_format
+        );
+
+        let handoff = super::frame_handoff::FrameHandoff::new();
+        let queue = super::frame_handoff::HandoffQueue::new(queue, handoff.waiter());
+        Ok(Self {
+            handoff,
+            surface: Mutex::new(Some(surface)),
+            instance,
+            window,
+            device,
+            queue,
+            config,
+            surface_format,
+            adapter_info,
+            capture_target,
+            timer,
+            color_vision: super::color_vision::ColorVisionFilter::new(),
+            #[cfg(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))]
+            web_present,
+        })
+    }
+
+    /// Publish this frame's colour-vision correction; `None` means `Off`.
+    /// The frame loop calls this once per frame, so the synchronous loading
+    /// repaints (which present outside the frame loop) use the same value.
+    pub(crate) fn set_color_vision_matrix(&self, matrix: Option<super::color_vision::Mat3>) {
+        self.color_vision.set_matrix(matrix);
+    }
+
+    /// Apply the published correction as the last draw before `present`.
+    pub(crate) fn encode_color_vision(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::Texture,
+    ) {
+        self.color_vision
+            .encode(&self.device, &self.queue, encoder, target);
+    }
+
+    /// Finish and submit `encoder`, then present `frame`, on the hand-off
+    /// thread (`frame_handoff`). Bounded submissions the frame already made
+    /// stay ahead of this one, as they went through the queue on this thread.
+    pub(crate) fn hand_off_frame(
+        &self,
+        encoder: wgpu::CommandEncoder,
+        frame: GpuFrame,
+    ) -> super::frame_handoff::FrameSubmission {
+        let queue = (*self.queue).clone();
+        let index = Arc::new(std::sync::OnceLock::new());
+        let submitted = Arc::clone(&index);
+        self.handoff.send(move || {
+            let _ = submitted.set(queue.submit(std::iter::once(encoder.finish())));
+            frame.present(&queue);
+        });
+        super::frame_handoff::FrameSubmission::new(index, self.handoff.waiter())
+    }
+
+    /// The time this thread spent blocked on a frame on its way to the driver
+    /// since the last call.
+    pub(crate) fn take_handoff_wait(&self) -> crate::util::time::Duration {
+        self.handoff.waiter().take_waited()
+    }
+
+    /// Return a borrowed capture-only view of the selected adapter identity.
+    pub(crate) fn capture_adapter_observation(&self) -> GpuAdapterObservation<'_> {
+        GpuAdapterObservation::from(&self.adapter_info)
+    }
+
+    /// The adapter's name when it is the system's software renderer, which
+    /// draws with the processor: Windows' Microsoft Basic Render Driver or
+    /// Mesa's llvmpipe. wgpu keeps it as the last choice when no graphics card
+    /// and driver qualify (`request_adapter` sorts `DeviceType::Cpu` last
+    /// instead of leaving it out); Metal never offers one.
+    #[cfg(not(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown")))]
+    pub(crate) fn software_renderer(&self) -> Option<&str> {
+        (self.adapter_info.device_type == wgpu::DeviceType::Cpu)
+            .then_some(self.adapter_info.name.as_str())
+    }
+
+    /// What the driver said once it has lost the graphics device: it crashed,
+    /// Windows reset it after it stopped responding (TDR), or the card ran out
+    /// of memory. Nothing reaches the screen after that, while the game would
+    /// run on behind a black window. `None` while the device works.
+    #[cfg(not(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown")))]
+    pub(crate) fn device_lost(&self) -> Option<&str> {
+        lost_device()
+    }
+
+    /// Whether the window currently owns a render surface.
+    #[cfg(target_os = "android")]
+    pub(crate) fn has_surface(&self) -> bool {
+        self.surface
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some()
+    }
+
+    /// Release Android's native surface before the suspended callback returns.
+    /// Device resources survive; no acquisition can recreate the surface until
+    /// the next resumed callback explicitly restores it.
+    /// https://docs.rs/winit/0.30.13/winit/application/trait.ApplicationHandler.html#method.suspended
+    #[cfg(target_os = "android")]
+    pub(crate) fn suspend_surface(&mut self) {
+        self.handoff.waiter().wait();
+        drop(
+            self.surface
+                .get_mut()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take(),
+        );
+    }
+
+    /// Rebuild the swapchain against the window's current native surface.
+    ///
+    /// Android destroys the activity's surface when the screen turns off or the
+    /// app goes to the background, and winit's `Window` reports the replacement
+    /// native handle once it is resumed. A wgpu surface keeps the handle it was
+    /// created with, so it can never present again — reconfiguring it is not
+    /// enough, it has to be replaced.
+    /// Retain the configured dimensions here: the app's existing resize owner
+    /// updates the depth and offscreen targets together with the surface.
+    #[cfg(target_os = "android")]
+    pub(crate) fn restore_surface(&mut self) -> anyhow::Result<()> {
+        self.handoff.waiter().wait();
+        let slot = self
+            .surface
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner);
+        if slot.is_some() {
+            return Ok(());
+        }
+        let surface = self
+            .instance
+            .create_surface(self.window.clone())
+            .context("recreate the wgpu surface after a resume")?;
+        surface.configure(&self.device, &self.config);
+        *slot = Some(surface);
+        log::info!(
+            "Surface restored at {}x{}",
+            self.config.width,
+            self.config.height
+        );
+        Ok(())
+    }
+
+    /// Handle window resize — reconfigure the surface with new dimensions.
+    ///
+    /// Called from ApplicationHandler::window_event when WindowEvent::Resized fires.
+    /// Ignores zero-sized dimensions (happens during window minimize on some platforms).
+    pub fn resize(&mut self, width: u32, height: u32) {
+        if width == 0 || height == 0 {
+            return; // Minimized window — skip reconfigure
+        }
+        // Configuring a surface needs its last frame presented.
+        self.handoff.waiter().wait();
+        self.config.width = width;
+        self.config.height = height;
+        if let Some(surface) = self
+            .surface
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+        {
+            surface.configure(&self.device, &self.config);
+        }
+        if let Some(target) = &mut self.capture_target {
+            target.resize(&self.device, &self.config);
+        }
+        #[cfg(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))]
+        {
+            self.web_present = Arc::new(web_present::WebPresent::new(
+                &self.device,
+                &self.queue,
+                &self.config,
+            ));
+        }
+        log::debug!("Surface resized to {}x{}", width, height);
+    }
+
+    /// Present in step with the display (`Fifo`), or as soon as a frame is
+    /// drawn: `AutoNoVsync` takes `Immediate`, else `Mailbox`, else `Fifo`, so
+    /// a surface without the first two keeps syncing. The Options page's
+    /// VSync box (`[VERA] VSync=`).
+    /// https://docs.rs/wgpu/30.0.1/wgpu/enum.PresentMode.html
+    pub fn set_vsync(&mut self, vsync: bool) {
+        let (mode, latency) = present_settings(vsync);
+        if self.config.present_mode == mode && self.config.desired_maximum_frame_latency == latency
+        {
+            return;
+        }
+        // Configuring a surface needs its last frame presented.
+        self.handoff.waiter().wait();
+        self.config.present_mode = mode;
+        self.config.desired_maximum_frame_latency = latency;
+        if let Some(surface) = self
+            .surface
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+        {
+            surface.configure(&self.device, &self.config);
+        }
+        log::info!("Surface present mode: {mode:?}");
+    }
+
+    /// Take the window's next frame to draw into, or `None` when there is none
+    /// this time and the next redraw should try again.
+    ///
+    /// A stale or suboptimal swapchain is reconfigured once and asked again;
+    /// a lost surface is recreated first, as wgpu requires. Timeout and
+    /// occlusion skip this redraw. Validation failures remain errors.
+    /// https://docs.rs/wgpu/30.0.1/wgpu/enum.CurrentSurfaceTexture.html
+    pub fn acquire_frame(&self) -> Result<Option<GpuFrame>> {
+        // A surface gives out one frame at a time, and drawing keeps plain
+        // queue clones that do not wait for themselves (`HandoffQueue`).
+        self.handoff.waiter().wait();
+        let mut surface = self.surface.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(surface) = surface.as_mut() else {
+            return Ok(None);
+        };
+        if let Some(target) = &self.capture_target {
+            return Ok(Some(target.frame()));
+        }
+        acquire_with_recovery(|recovery| {
+            if let Some(recovery) = recovery {
+                log::warn!(
+                    "Surface texture: {recovery:?}; recovering the surface at {}x{}",
+                    self.config.width,
+                    self.config.height
+                );
+                if recovery == SurfaceRecovery::Recreate {
+                    *surface = self
+                        .instance
+                        .create_surface(self.window.clone())
+                        .context("recreate lost wgpu surface")?;
+                }
+                surface.configure(&self.device, &self.config);
+            }
+            Ok(surface.get_current_texture())
+        })
+        .map(|frame| {
+            frame.map(|surface| {
+                let frame = GpuFrame::from_surface(surface);
+                #[cfg(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))]
+                let frame = GpuFrame {
+                    texture: self.web_present.texture.clone(),
+                    web_present: Some(self.web_present.clone()),
+                    ..frame
+                };
+                frame
+            })
+        })
+    }
+
+    /// Create a depth texture matching the current surface dimensions.
+    ///
+    /// Must be recreated whenever the window is resized (surface dimensions change).
+    /// Uses Depth32Float format matching the batch pipeline's depth_stencil state.
+    pub fn create_depth_texture(&self) -> wgpu::TextureView {
+        let texture: wgpu::Texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Depth Texture"),
+            size: wgpu::Extent3d {
+                width: self.config.width.max(1),
+                height: self.config.height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        texture.create_view(&Default::default())
+    }
+}
+
+/// What the driver said when it lost the process's graphics device
+/// (`watch_device_loss`), for [`GpuContext::device_lost`] and for the panic
+/// hook: a panic after the loss (wgpu's own, on the first buffer it maps on
+/// the dead device, or any renderer's) is the loss's consequence, and the
+/// player is told about the driver, not about an internal error
+/// (`app::system_dialog::report_panic`). The game has one device; a second
+/// context would share this.
+#[cfg(not(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown")))]
+static LOST_DEVICE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The driver's message once the graphics device is lost; `None` while it
+/// works. See [`GpuContext::device_lost`].
+#[cfg(not(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown")))]
+pub(crate) fn lost_device() -> Option<&'static str> {
+    LOST_DEVICE.get().map(String::as_str)
+}
+
+/// Watch `device` for its loss. wgpu reports a loss once, on whichever thread
+/// met the driver's error (this one, the frame hand-off thread or a loading
+/// thread); its message is kept for [`GpuContext::device_lost`] and logged.
+/// Every resource is invalid after a loss, so the work recorded until the
+/// frame loop sees it fails validation: those errors are logged, not fatal.
+/// Before a loss an error still ends the game, as wgpu's default handler
+/// (`default_error_handler`) does.
+#[cfg(not(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown")))]
+fn watch_device_loss(device: &wgpu::Device) {
+    device.set_device_lost_callback(move |reason, message| {
+        log::error!("Graphics device lost ({reason:?}): {message}");
+        let _ = LOST_DEVICE.set(message);
+    });
+    let logged = std::sync::atomic::AtomicBool::new(false);
+    device.on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
+        if lost_device().is_none() {
+            log::error!("Handling wgpu errors as fatal by default");
+            panic!("wgpu error: {error}\n");
+        }
+        if !logged.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            log::warn!("Ignoring wgpu errors on the lost device, the first: {error}");
+        }
+    }));
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SurfaceRecovery {
+    Reconfigure,
+    Recreate,
+}
+
+/// Request at most two frames, recovering before the second acquisition only.
+fn acquire_with_recovery(
+    mut acquire: impl FnMut(Option<SurfaceRecovery>) -> Result<wgpu::CurrentSurfaceTexture>,
+) -> Result<Option<wgpu::SurfaceTexture>> {
+    use wgpu::CurrentSurfaceTexture;
+
+    let recovery = match acquire(None)? {
+        CurrentSurfaceTexture::Success(frame) => return Ok(Some(frame)),
+        CurrentSurfaceTexture::Suboptimal(frame) => {
+            // Drop the acquired texture before reconfiguring its surface.
+            drop(frame);
+            SurfaceRecovery::Reconfigure
+        }
+        CurrentSurfaceTexture::Timeout | CurrentSurfaceTexture::Occluded => return Ok(None),
+        CurrentSurfaceTexture::Outdated => SurfaceRecovery::Reconfigure,
+        CurrentSurfaceTexture::Lost => SurfaceRecovery::Recreate,
+        CurrentSurfaceTexture::Validation => bail!("surface acquisition validation failed"),
+    };
+    match acquire(Some(recovery))? {
+        CurrentSurfaceTexture::Success(frame) | CurrentSurfaceTexture::Suboptimal(frame) => {
+            Ok(Some(frame))
+        }
+        CurrentSurfaceTexture::Timeout
+        | CurrentSurfaceTexture::Occluded
+        | CurrentSurfaceTexture::Outdated => Ok(None),
+        CurrentSurfaceTexture::Lost => bail!("surface still lost after recovery"),
+        CurrentSurfaceTexture::Validation => bail!("surface acquisition validation failed"),
+    }
+}
+
+/// Run `future` to completion on the calling thread.
+///
+/// Wakes are recorded in a flag behind a condvar rather than the thread's park
+/// token, which code inside `poll` could consume.
+pub fn block_on<F: Future>(future: F) -> F::Output {
+    struct Signal {
+        woken: Mutex<bool>,
+        condvar: Condvar,
+    }
+
+    impl Wake for Signal {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            *self.woken.lock().unwrap_or_else(PoisonError::into_inner) = true;
+            self.condvar.notify_one();
+        }
+    }
+
+    let signal = Arc::new(Signal {
+        woken: Mutex::new(false),
+        condvar: Condvar::new(),
+    });
+    let waker = Waker::from(Arc::clone(&signal));
+    let mut context = TaskContext::from_waker(&waker);
+    let mut future = std::pin::pin!(future);
+    loop {
+        if let Poll::Ready(output) = future.as_mut().poll(&mut context) {
+            return output;
+        }
+        let mut woken = signal.woken.lock().unwrap_or_else(PoisonError::into_inner);
+        while !*woken {
+            woken = signal
+                .condvar
+                .wait(woken)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        *woken = false;
+    }
+}
+
+/// The present mode and queued pictures for the VSync box: `Fifo` in step
+/// with the display, else `AutoNoVsync` (`Immediate`, else `Mailbox`, else
+/// `Fifo`).
+///
+/// VSync keeps wgpu's default two pictures queued, as every build before the
+/// box did. With one, the CPU and GPU no longer overlap: a picture whose work
+/// takes longer than one refresh waits for the next, and since a lent tick
+/// starts once per picture, the game itself slows to half speed. Without VSync
+/// a present never waits for the screen, so one queued picture only cuts the
+/// input delay.
+/// https://docs.rs/wgpu/30.0.1/wgpu/struct.SurfaceConfiguration.html#structfield.desired_maximum_frame_latency
+fn present_settings(vsync: bool) -> (wgpu::PresentMode, u32) {
+    if vsync {
+        (wgpu::PresentMode::Fifo, 2)
+    } else {
+        (wgpu::PresentMode::AutoNoVsync, 1)
+    }
+}
+
+#[cfg(all(test, tests_render_a_r))]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::Poll;
+
+    use wgpu::CurrentSurfaceTexture::{Lost, Occluded, Outdated, Timeout, Validation};
+
+    use super::{
+        CaptureTarget, SurfaceRecovery, acquire_with_recovery, block_on, lost_device,
+        present_settings, watch_device_loss,
+    };
+
+    /// With VSync a picture over one refresh must not wait a whole refresh
+    /// more: two pictures stay queued. Without it, one keeps input delay low.
+    #[test]
+    fn vsync_keeps_two_pictures_queued() {
+        assert_eq!(present_settings(true), (wgpu::PresentMode::Fifo, 2));
+        assert_eq!(present_settings(false), (wgpu::PresentMode::AutoNoVsync, 1));
+    }
+
+    /// A lost device reaches the frame loop, and a working one does not. The
+    /// frame recorded meanwhile, as in a player's DirectX 12 log, writes its
+    /// uploads into staging chunks made on the lost device and unmaps them:
+    /// neither may end the game first. A driver's loss can't be staged;
+    /// `destroy` loses the device through the same callback, at the next poll.
+    #[test]
+    #[ignore = "requires a wgpu adapter; loses a real device"]
+    fn a_lost_device_reaches_the_frame_loop_without_a_panic() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+            .expect("this test requires a wgpu adapter");
+        let (device, _queue) =
+            block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).unwrap();
+        watch_device_loss(&device);
+        let poll = || device.poll(wgpu::PollType::wait_indefinitely());
+        poll().unwrap();
+        assert_eq!(lost_device(), None);
+        device.destroy();
+        let _ = poll();
+        assert!(lost_device().is_some());
+
+        let mut encoder = device.create_command_encoder(&Default::default());
+        let mut pool = crate::render::batch::InstanceBufferPool::new();
+        pool.record_uploads(&device, &mut encoder)
+            .upload("units", &[crate::render::batch::SpriteInstance::default()]);
+        drop(encoder.finish());
+    }
+
+    /// Run one acquisition over `results`, the acquire answers in call order;
+    /// returns its outcome and recovery requests. Real frame presentation is
+    /// exercised by the normal window and GPU readback tests.
+    fn acquire_over(
+        results: Vec<wgpu::CurrentSurfaceTexture>,
+    ) -> (
+        anyhow::Result<Option<wgpu::SurfaceTexture>>,
+        Vec<Option<SurfaceRecovery>>,
+    ) {
+        let mut results = results.into_iter();
+        let mut requests = Vec::new();
+        let outcome = acquire_with_recovery(|recovery| {
+            requests.push(recovery);
+            Ok(results.next().expect("acquired more often than scripted"))
+        });
+        assert!(results.next().is_none(), "scripted answers left unasked");
+        (outcome, requests)
+    }
+
+    #[test]
+    fn timeout_and_occlusion_skip_without_recovery() {
+        let (outcome, requests) = acquire_over(vec![Timeout]);
+        assert!(outcome.unwrap().is_none());
+        assert_eq!(requests, [None]);
+        let (outcome, requests) = acquire_over(vec![Occluded]);
+        assert!(outcome.unwrap().is_none());
+        assert_eq!(requests, [None]);
+    }
+
+    #[test]
+    fn stale_swapchain_reconfigures_once_and_skips_if_still_stale() {
+        let (outcome, requests) = acquire_over(vec![Outdated, Outdated]);
+        assert!(outcome.unwrap().is_none());
+        assert_eq!(requests, [None, Some(SurfaceRecovery::Reconfigure)]);
+    }
+
+    #[test]
+    fn lost_surface_recreates_once_and_validation_stays_an_error() {
+        let (outcome, requests) = acquire_over(vec![Lost, Lost]);
+        assert!(outcome.unwrap_err().to_string().contains("still lost"));
+        assert_eq!(requests, [None, Some(SurfaceRecovery::Recreate)]);
+        let (outcome, requests) = acquire_over(vec![Validation]);
+        assert!(outcome.unwrap_err().to_string().contains("validation"));
+        assert_eq!(requests, [None]);
+    }
+
+    #[test]
+    #[ignore = "requires a wgpu adapter for hidden capture frame readback"]
+    fn hidden_capture_frame_renders_reads_back_and_resizes_without_a_swapchain() {
+        use crate::render::frame_readback::PendingTextureReadback;
+
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::PRIMARY,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            compatible_surface: None,
+            ..Default::default()
+        }))
+        .expect("hidden capture regression requires a GPU adapter");
+        let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+            .expect("request hidden capture regression device");
+        let mut config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
+            format: wgpu::TextureFormat::Bgra8UnormSrgb,
+            width: 2,
+            height: 1,
+            present_mode: wgpu::PresentMode::Fifo,
+            alpha_mode: wgpu::CompositeAlphaMode::Opaque,
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+            color_space: wgpu::SurfaceColorSpace::Auto,
+        };
+        let mut target = CaptureTarget::new(&device, &config);
+        let render =
+            |target: &CaptureTarget, config: &wgpu::SurfaceConfiguration, color: wgpu::Color| {
+                let frame = target.frame();
+                assert!(frame.surface.is_none());
+                assert_eq!(frame.texture.format(), config.format);
+                assert_eq!(frame.texture.usage(), config.usage);
+                assert_eq!(frame.texture.width(), config.width);
+                assert_eq!(frame.texture.height(), config.height);
+                let view = frame.texture.create_view(&Default::default());
+                let mut encoder = device.create_command_encoder(&Default::default());
+                {
+                    let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("Hidden capture production frame regression"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &view,
+                            resolve_target: None,
+                            depth_slice: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(color),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                }
+                let pending = PendingTextureReadback::encode(
+                    &device,
+                    &mut encoder,
+                    &frame.texture,
+                    config.format,
+                    config.width,
+                    config.height,
+                )
+                .expect("read back the actual capture frame");
+                let submission = queue.submit([encoder.finish()]);
+                frame.present(&queue);
+                pending
+                    .finish(&device, submission, std::time::Duration::from_secs(10))
+                    .expect("finish hidden frame readback")
+            };
+        assert_eq!(
+            render(&target, &config, wgpu::Color::RED),
+            [0, 0, 255, 255, 0, 0, 255, 255]
+        );
+        (config.width, config.height) = (1, 2);
+        target.resize(&device, &config);
+        assert_eq!(
+            render(&target, &config, wgpu::Color::BLUE),
+            [255, 0, 0, 255, 255, 0, 0, 255]
+        );
+    }
+
+    #[test]
+    fn block_on_sleeps_until_another_thread_wakes_the_future() {
+        let ready = Arc::new(AtomicBool::new(false));
+        let mut spawned = false;
+        let output = block_on(std::future::poll_fn(|context| {
+            if ready.load(Ordering::Acquire) {
+                return Poll::Ready(7);
+            }
+            if !spawned {
+                spawned = true;
+                let (ready, waker) = (Arc::clone(&ready), context.waker().clone());
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    ready.store(true, Ordering::Release);
+                    waker.wake();
+                });
+            }
+            Poll::Pending
+        }));
+        assert_eq!(output, 7);
+    }
+}
