@@ -1,6 +1,6 @@
 # HRA20K
 
-《命令与征服：红色警戒2 尤里的复仇》的 HarmonyOS 2in1 原生移植，游戏引擎来自开源项目 [VERA20K](https://github.com/YuriPlanet/vera20k)。
+[VERA20K](https://github.com/YuriPlanet/vera20k) 的 HarmonyOS 2in1 移植，用于运行《命令与征服：红色警戒2 尤里的复仇》。
 
 ![HRA20K 应用图标](store/icon/hra20k_icon_216.png)
 
