@@ -64,10 +64,16 @@ impl LoopShared {
         }
     }
 
+    /// Wakes the loop for a message or a state change from another thread.
+    /// A callback on the loop thread itself must not unpark: the token would
+    /// make the next `park_timeout` return at once, and the loop would spin
+    /// through `about_to_wait` without ever resting.
     pub(crate) fn wake(&self) {
         let thread = self.thread.lock().unwrap().clone();
         if let Some(thread) = thread {
-            thread.unpark();
+            if thread.id() != std::thread::current().id() {
+                thread.unpark();
+            }
         }
     }
 
@@ -470,6 +476,12 @@ impl<T: 'static> EventLoop<T> {
             }
 
             if self.shared.redraw.swap(false, Ordering::SeqCst) {
+                // A dispatched redraw is work this turn: `about_to_wait` must
+                // run and set the next deadline before the loop rests. The
+                // deadline it asked with can be stale (`Wait`), and honoring
+                // it here would sleep through the pass that services and
+                // requests the next draw.
+                handled_any = true;
                 if let Some(window) = self.shared.window() {
                     app.window_event(&active, window.id(), WindowEvent::RedrawRequested);
                 }

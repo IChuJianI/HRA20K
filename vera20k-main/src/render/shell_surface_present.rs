@@ -57,6 +57,14 @@ pub(crate) struct ShellSurfacePresenter {
     pipeline: wgpu::RenderPipeline,
     surface_format: wgpu::TextureFormat,
     encoded_format: wgpu::TextureFormat,
+    /// Present the composed sRGB surface with a byte copy instead of the
+    /// RGB565 pass. Set on native targets: the quantized pass renders the
+    /// correct colours in most pixels but the Maleoon 916 driver replaces
+    /// whole 8 px tiles of the target with uninitialized memory (seen with
+    /// both an oversized fullscreen triangle and an exact clip-bounds quad),
+    /// while a copy of the same composed surface is pixel-correct. The copy
+    /// skips only the retail 16-bit quantization.
+    present_by_copy: bool,
     width: u32,
     height: u32,
 }
@@ -111,6 +119,18 @@ impl ShellSurfacePresenter {
             mapped_at_creation: false,
         });
         let pipeline = create_pipeline(&gpu.device, &bind_group_layout, encoded_format);
+        let present_by_copy = !super::gpu::webgl_fallback(&gpu.device);
+        log::info!(
+            "Shell presentation: {} at {}x{} {:?}",
+            if present_by_copy {
+                "byte copy of the composed sRGB surface"
+            } else {
+                "RGB565 quantization pass"
+            },
+            gpu.config.width,
+            gpu.config.height,
+            surface_format
+        );
         let targets = create_targets(
             &gpu.device,
             &bind_group_layout,
@@ -137,6 +157,7 @@ impl ShellSurfacePresenter {
             pipeline,
             surface_format,
             encoded_format,
+            present_by_copy,
             width: gpu.config.width,
             height: gpu.config.height,
         })
@@ -218,12 +239,18 @@ impl ShellSurfacePresenter {
 
     /// Quantize the completed shell and copy its encoded bytes to the surface,
     /// or to a smaller target (a zoomed match frame) from the top-left corner.
+    /// Native targets copy the composed sRGB bytes instead; see
+    /// [`Self::present_by_copy`].
     pub(crate) fn encode_present(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         destination: &wgpu::Texture,
     ) {
-        self.encode_present_with_group(encoder, destination, &self.bind_group);
+        if self.present_by_copy {
+            self.encode_copy(encoder, destination);
+        } else {
+            self.encode_present_with_group(encoder, destination, &self.bind_group);
+        }
     }
 
     /// Present with native 16-bit surface effects. The effects buffer is
@@ -236,12 +263,42 @@ impl ShellSurfacePresenter {
         destination: &wgpu::Texture,
         effects: SurfaceEffects,
     ) {
+        if self.present_by_copy {
+            // The effects scale RGB565 units; the composed sRGB surface has
+            // none, so the copy cannot apply them (credits roll without the
+            // native edge fade on this path).
+            self.encode_copy(encoder, destination);
+            return;
+        }
         queue.write_buffer(
             &self.effects_buffer,
             0,
             bytemuck::cast_slice(&effects.words(self.height)),
         );
         self.encode_present_with_group(encoder, destination, &self.effects_bind_group);
+    }
+
+    fn encode_copy(&self, encoder: &mut wgpu::CommandEncoder, destination: &wgpu::Texture) {
+        debug_assert_eq!(destination.format(), self.surface_format);
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.source_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: destination,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: destination.width().min(self.width),
+                height: destination.height().min(self.height),
+                depth_or_array_layers: 1,
+            },
+        );
     }
 
     fn encode_present_with_group(
