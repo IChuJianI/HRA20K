@@ -1,6 +1,6 @@
 //! Dialog `0x101` Movies & Credits page table.
 
-use crate::ui::shell::descriptor::DialogId;
+use crate::ui::shell::descriptor::DialogResourceId;
 use crate::ui::shell::menu_page::{self, MenuPageButtonSpec, MenuPageLayout, MenuPageSpec};
 
 /// RT_DIALOG `0x101` owner-draw buttons with the results written by dialog
@@ -11,45 +11,20 @@ use crate::ui::shell::menu_page::{self, MenuPageButtonSpec, MenuPageLayout, Menu
 pub const LICENSE_CONTROL: u16 = 0x7F70;
 
 pub const MOVIES_CREDITS_PAGE: MenuPageSpec = MenuPageSpec {
-    dialog: DialogId(0x0101),
+    dialog: DialogResourceId(0x0101),
     title_key: "GUI:MoviesAndCredits",
     stacked: &[
-        MenuPageButtonSpec {
-            id: 0x068D,
-            dlu_top: 122,
-            csf_key: "GUI:SneakPeeks",
-            tooltip_key: "STT:OptionsButtonSneak",
-            result: Some(0x0D),
-        },
-        MenuPageButtonSpec {
-            id: 0x068E,
-            dlu_top: 149,
-            csf_key: "GUI:PlayMovies",
-            tooltip_key: "STT:OptionsButtonMovies",
-            result: Some(0x0E),
-        },
-        MenuPageButtonSpec {
-            id: 0x068F,
-            dlu_top: 176,
-            csf_key: "GUI:ViewCredits",
-            tooltip_key: "STT:OptionsButtonCredits",
-            result: Some(0x0F),
-        },
-        MenuPageButtonSpec {
-            id: LICENSE_CONTROL,
-            dlu_top: 203,
-            csf_key: "VERA:LegalPage",
-            tooltip_key: "VERA:LegalPageHelp",
-            result: Some(0x10),
-        },
+        MenuPageButtonSpec::new(0x068D, 122, "GUI:SneakPeeks", "STT:OptionsButtonSneak")
+            .returning(0x0D),
+        MenuPageButtonSpec::new(0x068E, 149, "GUI:PlayMovies", "STT:OptionsButtonMovies")
+            .returning(0x0E),
+        MenuPageButtonSpec::new(0x068F, 176, "GUI:ViewCredits", "STT:OptionsButtonCredits")
+            .returning(0x0F),
+        MenuPageButtonSpec::new(LICENSE_CONTROL, 203, "VERA:LegalPage", "VERA:LegalPageHelp")
+            .returning(0x10),
     ],
-    back: MenuPageButtonSpec {
-        id: 0x0686,
-        dlu_top: 346,
-        csf_key: "GUI:MainMenu",
-        tooltip_key: "STT:OptionsButtonBack",
-        result: Some(0x12),
-    },
+    back: MenuPageButtonSpec::new(0x0686, 346, "GUI:MainMenu", "STT:OptionsButtonBack")
+        .returning(0x12),
 };
 
 /// Main-loop state a `0x101` command selects.
@@ -130,14 +105,10 @@ mod tests {
                 .map(|button| button.rect)
                 .collect::<Vec<RectPx>>()
         };
-        // The three retail rows keep the Single Player page's geometry; VERA's
-        // License row and the Back tile follow them.
-        let movies_rects = rects(&movies);
-        let single_rects = rects(&single);
-        assert_eq!(movies_rects[..3], single_rects[..3]);
+        assert_eq!(rects(&movies)[..3], rects(&single)[..3]);
         assert_eq!(
-            movies_rects.last(),
-            single_rects.last(),
+            rects(&movies).last(),
+            rects(&single).last(),
             "Back keeps the final tile"
         );
         assert_eq!(

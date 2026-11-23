@@ -145,7 +145,7 @@ impl DeferredDeleteQueue {
             } else {
                 self.prefix_counts[index] -= 1;
             }
-            // The stable spelling of `isolate_lowest_one` (nonzero index).
+            // Stable-1.95 equivalent of the unstable usize::isolate_lowest_one.
             index += index & index.wrapping_neg();
         }
     }

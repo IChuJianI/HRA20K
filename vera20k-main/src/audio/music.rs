@@ -231,7 +231,13 @@ impl MusicPlayer {
             .ok()?;
         #[cfg(all(test, not(target_env = "ohos")))]
         let device = MusicOutput::Device(device);
-        #[allow(unused_mut)]
+        #[cfg_attr(
+            any(
+                target_env = "ohos",
+                all(feature = "wasm", target_arch = "wasm32", target_os = "unknown")
+            ),
+            expect(unused_mut, reason = "no physical output health on this target")
+        )]
         let mut player = Self::with_output(device);
         #[cfg(not(any(
             target_env = "ohos",
@@ -364,10 +370,10 @@ impl MusicPlayer {
     }
 
     pub(crate) fn tick_stream_volume(&mut self, now_ms: u64) {
-        #[cfg(not(any(
-            target_env = "ohos",
-            all(feature = "wasm", target_arch = "wasm32", target_os = "unknown")
-        )))]
+        #[cfg(all(
+            not(target_env = "ohos"),
+            not(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))
+        ))]
         self.reopen_lost_output(now_ms);
         if self.own.tick(now_ms) {
             self.apply_effective_volume();

@@ -191,7 +191,7 @@ pub(crate) fn tick_particle_system(
     sim: &mut Simulation,
     rules: &RuleSet,
     id: u64,
-    context: crate::sim::world::UninitContext<'_>,
+    mut context: crate::sim::world::UninitContext<'_>,
 ) -> bool {
     let Some(sys) = sim.particle_systems().get(id) else {
         return false;
@@ -214,11 +214,11 @@ pub(crate) fn tick_particle_system(
     if behavior == ParticleSystemBehavesLike::Gas {
         // Gas damage may synchronously kill another animal and append to this
         // same system. Retain its body in storage through those callbacks.
-        super::gas::tick_system(sim, rules, id, context);
+        super::gas::tick_system(sim, rules, id, context.reborrow());
     } else if behavior == ParticleSystemBehavesLike::Smoke {
         super::smoke::tick_system(sim, rules, id);
     } else if behavior == ParticleSystemBehavesLike::Fire {
-        super::fire::tick_system(sim, rules, id, context);
+        super::fire::tick_system(sim, rules, id, context.reborrow());
     } else {
         let mut sys = sim.substrate.particle_systems.take_for_tick(id).unwrap();
         tick_one_system(&mut sys, sim, rules);
@@ -444,13 +444,7 @@ mod tests {
         assert_eq!(sim.main_rng.logical_state(), old_rng);
 
         let unknown_id = rules.p_type_id_by_name("U").unwrap();
-        let mut unknown = Particle::new(
-            unknown_id,
-            origin,
-            origin,
-            rules.particle_type(unknown_id),
-            &mut sim,
-        );
+        let mut unknown = Particle::new(unknown_id, origin, origin, &rules, &mut sim);
         let old_rng = sim.main_rng.logical_state();
         tick_particle(&mut unknown, &mut sim, &rules, None, None);
         assert!(unknown.marked_for_deletion());
@@ -463,7 +457,7 @@ mod tests {
             fire_id,
             origin,
             IVec3::new(128, 1024, 100),
-            rules.particle_type(fire_id),
+            &rules,
             &mut sim,
         );
         assert_eq!(fire.draw_frame(rules.particle_type(fire_id)), 9);
@@ -509,7 +503,7 @@ mod tests {
             kind,
             IVec3::new(5248, 5248, 0),
             IVec3::ZERO,
-            rules.particle_type(kind),
+            &rules,
             &mut sim,
         );
         let system = sim.substrate.particle_systems.get_mut(host).unwrap();
@@ -523,7 +517,7 @@ mod tests {
         ));
         let target = sim.entities().get(target).unwrap();
         assert_eq!(target.health.current(), 40);
-        assert!(target.damage_smoke_system_id.system().is_some());
+        assert!(target.seldom.damage_smoke_system_id.system().is_some());
         assert_eq!(sim.particle_systems().get(host).unwrap().particles.len(), 1);
     }
 
@@ -575,7 +569,7 @@ mod tests {
             kind,
             IVec3::new(at.x, at.y, at.z),
             IVec3::ZERO,
-            rules.particle_type(kind),
+            &rules,
             &mut sim,
         );
         let system = sim.substrate.particle_systems.get_mut(host).unwrap();
@@ -652,7 +646,7 @@ mod tests {
                         kind,
                         IVec3::new(i32::from(x) * 256 + 128, 5248, 0),
                         IVec3::ZERO,
-                        rules.particle_type(kind),
+                        &rules,
                         &mut sim,
                     );
                     sim.substrate

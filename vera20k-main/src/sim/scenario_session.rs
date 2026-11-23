@@ -1161,7 +1161,12 @@ impl ScenarioSession {
     /// The Rules `[General] HarvesterUnit=` types (`+0xB3C`, filled at
     /// `0x0066F973`, VehicleTypes only) that bit `0x800` protects, as
     /// interned ids for native's type-pointer compares; empty while the bit
-    /// is clear.
+    /// is clear, which allocates nothing.
+    ///
+    /// Resolved per scan and per splash, not once when the bit is set: a
+    /// `HarvesterUnit=` name gets its id only when the first such unit is
+    /// made, and `get` adds no ids, so a list resolved earlier would miss a
+    /// type interned since. With the bit set it is one short list per call.
     pub fn truce_harvester_types(
         &self,
         rules: &crate::rules::ruleset::RuleSet,
@@ -1198,6 +1203,15 @@ impl ScenarioSession {
 
     pub const fn map_height(&self) -> u16 {
         self.map_height
+    }
+
+    /// `[Map] Size` width plus height past the original engine's 512 limit, so
+    /// only VERA's map extension reads it ([docs/map-format.md]). The session
+    /// stores that sum as the canonical cell-array extent, not the raw axis.
+    ///
+    /// [docs/map-format.md]: ../../docs/map-format.md
+    pub const fn map_exceeds_original_size(&self) -> bool {
+        self.map_width > 512
     }
 
     pub const fn mp_start_waypoints(&self) -> &BTreeMap<u32, (u16, u16)> {
@@ -1457,8 +1471,23 @@ impl ScenarioSession {
     pub const fn rule_policy(&self) -> RulePolicy {
         self.rule_policy
     }
+
+    /// Map House construction and campaign presentation survive a lockstep
+    /// admission. A stock slot launch can independently use campaign rules.
+    pub const fn uses_campaign_world(&self) -> bool {
+        self.campaign.is_some()
+            || (self.multiplayer_mode_class.is_none()
+                && !self.rule_policy.bootstrap().uses_multiplayer_rules())
+    }
     pub(crate) const fn local_view_identity(&self) -> &LocalViewIdentity {
         &self.view
+    }
+
+    /// A campaign recording clears the process view. Playback keeps the view
+    /// supplied by the fresh loader while replacing the shared admission.
+    pub(super) fn with_replay_view(mut self, reconstructed: Option<&Self>) -> Self {
+        self.view = reconstructed.map_or_else(LocalViewIdentity::default, |session| session.view);
+        self
     }
     pub const fn game_mode_nonzero(&self) -> bool {
         self.game_mode.is_nonzero()
@@ -1663,11 +1692,18 @@ impl ScenarioSession {
             .scope(source, primary, subject, houses)
     }
 
-    pub(crate) fn control_scope_table(
+    /// The grant admitted `source` holds on `subject`'s House, its primary
+    /// House's own authority aside.
+    pub(crate) fn delegated_control_scope(
         &self,
         houses: &Houses,
-    ) -> Option<std::sync::Arc<crate::sim::control_authority::ControlScopeTable>> {
-        self.control_authority.scope_table(houses)
+        source: i8,
+        subject: InternedId,
+    ) -> ControlScope {
+        usize::try_from(source).map_or(ControlScope::None, |source| {
+            self.control_authority
+                .delegated_scope(source, subject, houses)
+        })
     }
 
     pub(crate) fn admitted_control_source_count(&self) -> Option<usize> {
@@ -1930,6 +1966,10 @@ impl ScenarioSession {
         &self.chrono_screen
     }
 
+    pub fn chrono_screen_active(&self) -> bool {
+        self.chrono_screen.active()
+    }
+
     pub(crate) fn start_chrono_screen_state(&mut self, duration: i32) -> bool {
         let admitted = self.chrono_screen.start(duration, self.input_locked);
         if admitted {
@@ -1974,7 +2014,7 @@ impl ScenarioSession {
         restart_carry_over: crate::sim::campaign_carry_over::CampaignCarryOver,
         authored_fog_of_war: Option<bool>,
     ) -> Result<(), CampaignScenarioStartupError> {
-        if self.game_mode_nonzero() {
+        if self.rule_policy.bootstrap().uses_multiplayer_rules() {
             return Err(CampaignScenarioStartupError::NonCampaignMode);
         }
         if self.campaign.is_some() {
@@ -3167,6 +3207,20 @@ mod tests {
         let mut json = serde_json::to_value(&immune.session).unwrap();
         json.as_object_mut().unwrap().remove("harvester_immune");
         assert!(serde_json::from_value::<ScenarioSession>(json).is_err());
+    }
+
+    /// `[Map] Size` width plus height exactly 512 is still readable by the
+    /// original; the session stores that sum as the canonical extent, so only
+    /// one past it turns the map VERA-only.
+    #[test]
+    fn map_exceeds_original_size_holds_the_512_sum_boundary() {
+        let mut sim = Simulation::new();
+        sim.session.set_map_width_for_test(512);
+        sim.session.set_map_height_for_test(512);
+        assert!(!sim.session.map_exceeds_original_size());
+        sim.session.set_map_width_for_test(513);
+        sim.session.set_map_height_for_test(513);
+        assert!(sim.session.map_exceeds_original_size());
     }
 }
 

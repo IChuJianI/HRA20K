@@ -28,9 +28,25 @@ impl App {
         let Some(error) = state.renderer.gpu.device_lost().map(str::to_owned) else {
             return false;
         };
+        // DirectX 12's own reason tells a GPU hang from a driver fault; wgpu's
+        // message says only that the device is lost.
+        let error = match state.renderer.gpu.device_removed_reason() {
+            Some(reason) => {
+                log::error!("{reason}");
+                format!("{error}. {reason}")
+            }
+            None => error,
+        };
         log::info!("Closing: the graphics device is lost");
         let saved = save_match(state);
-        state.frontend.graphics_lost = Some(GraphicsLost { error, saved });
+        // Lost before startup finished: the next start draws through the
+        // other Windows API, and the box says so.
+        let retry = crate::app::persistence::startup_backend::record_loss();
+        state.frontend.graphics_lost = Some(GraphicsLost {
+            error,
+            saved,
+            retry,
+        });
         Self::close_game(state, event_loop);
         true
     }

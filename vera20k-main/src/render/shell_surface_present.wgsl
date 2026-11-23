@@ -23,18 +23,13 @@ fn credits_fade_factor(row: u32) -> u32 {
     return 255u - min(256u - 8u * row, 255u);
 }
 
-// Two triangles exactly on the clip bounds: full viewport coverage without
-// depending on guard-band clipping of oversized vertices.
 @vertex
 fn vs_main(
     @builtin(vertex_index) vertex_index: u32,
 ) -> @builtin(position) vec4f {
-    let quad = array<vec2f, 6>(
-        vec2f(-1.0, 1.0), vec2f(1.0, 1.0), vec2f(-1.0, -1.0),
-        vec2f(-1.0, -1.0), vec2f(1.0, 1.0), vec2f(1.0, -1.0),
-    );
-    let corner = quad[vertex_index];
-    return vec4f(corner.x, corner.y, 0.0, 1.0);
+    let x = f32((vertex_index << 1u) & 2u);
+    let y = f32(vertex_index & 2u);
+    return vec4f(x * 2.0 - 1.0, 1.0 - y * 2.0, 0.0, 1.0);
 }
 
 @fragment

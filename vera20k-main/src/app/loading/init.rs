@@ -156,7 +156,7 @@ mod map_wall_owner_candidate_tests {
             EntityCategory::Structure,
         );
         entity
-            .type_facts
+            .seldom.type_facts
             .set_foundation_for_test(foundation.to_string().into());
         entity.lifecycle.set_object_alive_for_test(true);
         entity.lifecycle.set_cell_marked_for_test(true);
@@ -301,7 +301,7 @@ mod map_wall_owner_candidate_tests {
             assert!(entity.lifecycle.cell_marked());
             assert!(!entity.lifecycle.in_limbo());
             if entity.category() == EntityCategory::Structure {
-                for (dx, dy) in entity.type_facts.foundation().cell_offsets() {
+                for (dx, dy) in entity.seldom.type_facts.foundation().cell_offsets() {
                     let cell = terrain
                         .cell((origin.0 as i16 + dx) as u16, (origin.1 as i16 + dy) as u16)
                         .unwrap();
@@ -359,7 +359,7 @@ mod map_wall_owner_candidate_tests {
                     &[],
                     crate::app::types::SIM_TICK_MS,
                     TickLane::Ordinary,
-                    FrameEffects::default(),
+                    &mut FrameEffects::default(),
                 )
                 .unwrap();
             if let Some(id) = crate::sim::production::ready_building_entity_for_owner(
@@ -399,7 +399,7 @@ mod map_wall_owner_candidate_tests {
                 &[],
                 crate::app::types::SIM_TICK_MS,
                 TickLane::Ordinary,
-                FrameEffects::default(),
+                &mut FrameEffects::default(),
             )
             .unwrap();
         assert_eq!(
@@ -434,7 +434,7 @@ mod map_wall_owner_candidate_tests {
                 &[],
                 crate::app::types::SIM_TICK_MS,
                 TickLane::Ordinary,
-                FrameEffects::default(),
+                &mut FrameEffects::default(),
             )
             .unwrap();
         assert!(
@@ -951,7 +951,7 @@ mod map_wall_owner_candidate_tests {
                 &[],
                 16,
                 crate::sim::world::TickLane::Ordinary,
-                crate::sim::world::FrameEffects::default(),
+                &mut crate::sim::world::FrameEffects::default(),
             )
             .expect("fixture frame must complete");
         assert!(matches!(frame.lighting_events.as_slice(),
@@ -979,7 +979,7 @@ mod map_wall_owner_candidate_tests {
                 &[],
                 16,
                 crate::sim::world::TickLane::Ordinary,
-                crate::sim::world::FrameEffects::default(),
+                &mut crate::sim::world::FrameEffects::default(),
             )
             .expect("fixture frame must complete");
         assert!(
@@ -1652,12 +1652,12 @@ impl MapLoadInitial {
         &mut self,
         retention: &mut crate::app::shell_random_map::RandomMapGenerationRetention,
         mut resident: Option<&mut crate::sim::world::Simulation>,
-        session_mode: crate::sim::scenario_session::ScenarioGameMode,
+        topology: crate::sim::scenario_session::ExecutionTopology,
     ) {
         self.retained_campaign_special_flags = resident
             .as_deref()
             .map(crate::sim::world::Simulation::retained_campaign_special_flags);
-        self.retained_local_variables = if session_mode.is_network() {
+        self.retained_local_variables = if topology.is_lockstep() {
             None
         } else {
             resident
@@ -1776,6 +1776,51 @@ fn construction_trace_after_fill(
 }
 
 #[cfg(all(test, tests_app))]
+mod match_theater_tests {
+    use super::*;
+
+    /// VERA: a network match of the original game reads the original terrain
+    /// when its map names only tiles the original game has, and the game
+    /// folder's when it names another, here one the original table names and
+    /// only a tile pack holds; a skirmish reads the folder's.
+    #[test]
+    fn a_network_match_reads_the_original_terrain_unless_its_map_names_another_tile() {
+        use crate::assets::asset_manager::{AssetManager, MediaArchiveMode};
+        let dir = theater::terrain_test_install("match-theater");
+        let mut assets = AssetManager::new(dir.path(), MediaArchiveMode::STOCK_DIGITAL).unwrap();
+        let map_naming = |tiles: &[i32]| {
+            let mut map = crate::map::rmg::emit::empty_map_file(&Default::default(), 16, 16);
+            map.header.theater = "SNOW".to_owned();
+            map.cells = tiles
+                .iter()
+                .map(|&tile_index| crate::map::map_file::MapCell {
+                    rx: 1,
+                    ry: 1,
+                    tile_index,
+                    sub_tile: 0,
+                    z: 0,
+                    legacy_ice_byte: 0,
+                })
+                .collect();
+            map
+        };
+        // A cell without a tile names none.
+        let original_tiles = [0, theater::NO_TILE, i32::from(u16::MAX)];
+        let original = load_match_theater(&mut assets, &map_naming(&original_tiles), true).unwrap();
+        assert!(assets.names_pinned());
+        assert!(!original.lookup.is_morphable(0));
+
+        let skirmish = load_match_theater(&mut assets, &map_naming(&[0]), false).unwrap();
+        assert!(!assets.names_pinned());
+        assert!(skirmish.lookup.is_morphable(0));
+
+        let folder = load_match_theater(&mut assets, &map_naming(&[0, 1]), true).unwrap();
+        assert!(!assets.names_pinned());
+        assert!(folder.lookup.is_morphable(0));
+    }
+}
+
+#[cfg(all(test, tests_app))]
 mod fresh_transport_tests {
     use super::*;
 
@@ -1804,7 +1849,11 @@ mod fresh_transport_tests {
         );
         let before = resident.state_hash();
         let mut initial = MapLoadInitial::from_test_map_source(map, source);
-        initial.retain_process_state(&mut Default::default(), Some(&mut resident), mode);
+        initial.retain_process_state(
+            &mut Default::default(),
+            Some(&mut resident),
+            mode.execution_topology(),
+        );
         assert_eq!(resident.state_hash(), before, "preparation is read-only");
         let mut staged = Simulation::new();
         if let Some(prior) = initial.retained_local_variables {
@@ -1948,11 +1997,13 @@ pub(super) fn install_startup_session_mode(
     simulation: &mut crate::sim::world::Simulation,
     startup: &LoadingStartup,
 ) {
-    simulation.install_session_admission(
-        startup.session_mode(),
-        startup.launch_session().map(|launch| launch.mode.class),
-        startup.match_spec().rules(),
-    );
+    if startup.authored_campaign().is_none() {
+        simulation.install_session_admission(
+            startup.session_mode(),
+            startup.launch_session().map(|launch| launch.mode.class),
+            startup.match_spec().rules(),
+        );
+    }
     if let LoadingStartup::Network(accepted) = startup {
         simulation.install_network_timing(accepted.max_ahead_frames());
         let wol = accepted.wol_start();
@@ -2418,6 +2469,7 @@ impl MapLoadInitial {
             &house_roster,
             rule_policy,
             Some(&match_launch_descriptor),
+            None,
         )
         .expect("generated scenario post-map initialization");
         let crate_name_id =
@@ -2623,8 +2675,14 @@ pub(crate) fn load_map_initial_with_assets(
         options.normalize();
 
         let theater_name = crate::map::rmg::emit::theater_name(options.theater);
-        let theater = crate::map::theater::load_theater(asset_manager, theater_name)
-            .ok_or_else(|| anyhow::anyhow!("random map: theater {theater_name} unavailable"))?;
+        // VERA: a network room's players make one map from the original
+        // terrain files (`theater::network_terrain_files`).
+        let theater = crate::map::theater::load_theater_for_play(
+            asset_manager,
+            theater_name,
+            full_init_entry_mode.is_network(),
+        )
+        .ok_or_else(|| anyhow::anyhow!("random map: theater {theater_name} unavailable"))?;
 
         // Generate598A74 -> InitMap599A56 completes Full_Init before terrain
         // generation. Offline loads transfer outgoing writes; network loads
@@ -2677,8 +2735,13 @@ pub(crate) fn load_map_initial_with_assets(
         // real TMP data — the shore tiler and zone classifier read these.
         let blocks =
             crate::map::rmg::theater_blocks::TheaterTileBlocks::build(&theater.lookup, |name| {
-                asset_manager.get(name)
+                asset_manager.get_ref(name)
             });
+        if let Some(missing) =
+            blocks.missing_cliff_tile(&theater.lookup, resolved.ids.cliffs.cliff_set)
+        {
+            return Err(anyhow::anyhow!("random map: {missing}"));
+        }
 
         // `[AI] NeutralTechBuildings` plus each type's `Foundation=`. The phase
         // runs for every map type except 0, so an empty list here would both
@@ -3026,6 +3089,35 @@ pub(crate) fn load_map_from_initial(
     }
 }
 
+/// VERA: the theater a fresh map load reads. A network match of the original
+/// game reads the original theater INI and tiles
+/// (`theater::network_terrain_files`) whenever every tile the map names
+/// exists among them. Every player, and a replay, decides alike from the map
+/// and the retail files. A map naming a tile the original game lacks reads
+/// the game folder's terrain, as a selected mod's game and every other load
+/// do; its start then agrees on those files
+/// (`ProcessAssets::match_terrain_digest`).
+fn load_match_theater(
+    asset_manager: &mut crate::assets::asset_manager::AssetManager,
+    map: &crate::map::map_file::MapFile,
+    network: bool,
+) -> Option<theater::TheaterData> {
+    let loaded = theater::load_theater_for_play(asset_manager, &map.header.theater, network)?;
+    if !asset_manager.names_pinned() {
+        return Some(loaded);
+    }
+    if crate::map::resolved_terrain::map_tiles_exist(map, &loaded.lookup, |name| {
+        asset_manager.get_ref(name).is_some()
+    }) {
+        log::info!("Network match terrain: the original game's files");
+        return Some(loaded);
+    }
+    log::info!(
+        "Network match terrain: the game folder's files; the map names a tile the original game lacks"
+    );
+    theater::load_theater(asset_manager, &map.header.theater)
+}
+
 fn load_map_first_step(
     services: FreshMapLoadServices<'_>,
     initial: MapLoadInitial,
@@ -3080,6 +3172,13 @@ fn load_map_first_step(
                     Some(startup),
                 )
             }
+            FreshScenarioParts::AuthoredCampaign { match_seed } => (
+                FreshMapMaterialization::Authored,
+                match_seed,
+                None,
+                None,
+                None,
+            ),
         };
     validate_fresh_transport_before_effects(
         materialization,
@@ -3088,7 +3187,7 @@ fn load_map_first_step(
     )?;
     // Fresh construction follows the admitted scenario family. A replay's
     // recorded session mode is installed later for the simulation.
-    let construction_profile = if campaign.is_some() {
+    let construction_profile = if campaign.is_some() || startup.authored_campaign().is_some() {
         BootstrapRuleProfile::Campaign
     } else {
         BootstrapRuleProfile::Multiplayer
@@ -3110,8 +3209,11 @@ fn load_map_first_step(
     };
     // Load theater INI for tileset lookup, palette, and LAT configuration.
     // Also loads theater-specific MIX archives (e.g., isotemmd.mix) at highest priority.
-    let theater_result: Option<theater::TheaterData> =
-        theater::load_theater(services.asset_manager, &map_data.header.theater);
+    let theater_result: Option<theater::TheaterData> = load_match_theater(
+        services.asset_manager,
+        &map_data,
+        startup.session_mode().is_network(),
+    );
     if theater_cache_mismatch {
         services.progress.milestone(12)?;
         // Native advances while rebuilding each color scheme. Rust's theater
@@ -3283,9 +3385,15 @@ fn load_map_first_step(
                             {
                                 bootstrap_rng.install_process_mapgen_continuation(continuation);
                             }
-                            let campaign_game_options = campaign
-                                .as_ref()
-                                .and_then(|campaign| campaign.game_options());
+                            let authored_campaign = startup.authored_campaign();
+                            let campaign_game_options = if let Some(game_speed) = startup.authored_campaign_speed() {
+                                Some(crate::sim::game_options::GameOptions {
+                                    game_speed,
+                                    ..Default::default()
+                                })
+                            } else {
+                                campaign.as_ref().and_then(|campaign| campaign.game_options())
+                            };
                             let fresh_prefix = if let Some(plan) = scenario_prefix_plan {
                                 FreshScenarioPrefix::StockOffline(
                                     plan.bind_native_rules_receipt(
@@ -3296,11 +3404,25 @@ fn load_map_first_step(
                                         &rules,
                                     )?,
                                 )
+                            } else if let Some(network) = authored_campaign {
+                                FreshScenarioPrefix::Campaign {
+                                    difficulty: network.start.difficulty(),
+                                    mission_counter: network.start.mission_counter(),
+                                    network: Some(network),
+                                    native_rules_receipt,
+                                    rules: &rules,
+                                    map_data: &map_data,
+                                    house_roster: &house_roster,
+                                    game_options: campaign_game_options.as_ref(),
+                                    campaign_index: 0,
+                                    restart_carry_over: crate::sim::campaign_carry_over::CampaignCarryOver::CLEARED,
+                                }
                             } else {
                                 let campaign = campaign
                                     .as_ref()
                                     .expect("campaign admission supplies its startup");
                                 FreshScenarioPrefix::Campaign {
+                                    network: None,
                                     native_rules_receipt,
                                     rules: &rules,
                                     map_data: &map_data,
@@ -3316,8 +3438,9 @@ fn load_map_first_step(
                             };
                             let scenario_descriptor = crate::sim::scenario_session::ScenarioDescriptor {
                         seed: match_seed,
-                        map_name: skirmish_launch_session
-                            .and_then(|launch| launch.selected_map_file.clone())
+                        map_name: authored_campaign.map(|_| startup.selected_map_file().to_owned())
+                            .or_else(|| skirmish_launch_session
+                            .and_then(|launch| launch.selected_map_file.clone()))
                             .or_else(|| {
                                 campaign
                                     .as_ref()
@@ -3921,7 +4044,7 @@ fn load_map_first_step(
                                                                 prepared_manifest.finish(
                                                                     services.gpu,
                                                                     services.batch,
-                                                                ),
+                                                                )?,
                                                                 None,
                                                             )
                                                         } else {
@@ -3982,7 +4105,14 @@ fn load_map_first_step(
             &house_roster,
             rule_policy,
             match_launch_descriptor.as_ref(),
+            startup.authored_campaign().map(|campaign| campaign.start.carry_over()),
         )?;
+                                                                            if let LoadingStartup::AuthoredCampaignReplay { native_id_prefix, .. } = &startup {
+            anyhow::ensure!(
+                sim.native_identity_prefix_checkpoint() == Some(*native_id_prefix),
+                "replay campaign native-ID prefix differs from the reconstructed House roster"
+            );
+        }
                                                                             if !output.navigation_published {
             log::error!("Initial navigation rebuild failed: resolved terrain is unavailable");
         }
@@ -4190,17 +4320,9 @@ mod full_init_rules_gate_tests {
 
     #[test]
     fn generated_rules_are_read_before_generation_and_carried_once_through_failure() {
-        // The game loads a map on its main thread, which has 8 MiB on every
-        // platform (build.rs links `/STACK` on Windows), as the simulation
-        // thread has. Unoptimized, the frames from here to RuleSet::project
-        // hold about 2.2 MiB of Rules copies, past libtest's 2 MiB thread.
-        let test = std::thread::Builder::new()
-            .stack_size(8 << 20)
-            .spawn(generated_rules_read_before_generation_and_carried)
-            .unwrap();
-        if let Err(panic) = test.join() {
-            std::panic::resume_unwind(panic);
-        }
+        // Unoptimized, the frames from here to RuleSet::project hold about
+        // 2.2 MiB of Rules copies, past libtest's 2 MiB thread.
+        crate::test_fixture::on_game_stack(generated_rules_read_before_generation_and_carried);
     }
 
     fn generated_rules_read_before_generation_and_carried() {

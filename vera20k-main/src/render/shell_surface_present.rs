@@ -57,14 +57,6 @@ pub(crate) struct ShellSurfacePresenter {
     pipeline: wgpu::RenderPipeline,
     surface_format: wgpu::TextureFormat,
     encoded_format: wgpu::TextureFormat,
-    /// Present the composed sRGB surface with a byte copy instead of the
-    /// RGB565 pass. Set on native targets: the quantized pass renders the
-    /// correct colours in most pixels but the Maleoon 916 Vulkan driver
-    /// replaces whole 8 px tiles of the target with uninitialized memory
-    /// (seen with both an oversized fullscreen triangle and an exact
-    /// clip-bounds quad), while a copy of the same composed surface is
-    /// pixel-correct. The copy skips only the retail 16-bit quantization.
-    present_by_copy: bool,
     width: u32,
     height: u32,
 }
@@ -130,12 +122,6 @@ impl ShellSurfacePresenter {
             gpu.config.height,
         );
 
-        log::info!(
-            "Presenter created at config {}x{} format={:?}",
-            gpu.config.width,
-            gpu.config.height,
-            surface_format
-        );
         Ok(Self {
             source_texture: targets.source_texture,
             source_render_view: targets.source_render_view,
@@ -151,7 +137,6 @@ impl ShellSurfacePresenter {
             pipeline,
             surface_format,
             encoded_format,
-            present_by_copy: !super::gpu::webgl_fallback(&gpu.device),
             width: gpu.config.width,
             height: gpu.config.height,
         })
@@ -204,13 +189,6 @@ impl ShellSurfacePresenter {
         if self.width == gpu.config.width && self.height == gpu.config.height {
             return;
         }
-        log::info!(
-            "Presenter resize {}x{} -> {}x{}",
-            self.width,
-            self.height,
-            gpu.config.width,
-            gpu.config.height
-        );
         debug_assert_eq!(self.surface_format, gpu.surface_format);
         debug_assert_eq!(
             self.encoded_format,
@@ -238,21 +216,14 @@ impl ShellSurfacePresenter {
         self.height = gpu.config.height;
     }
 
-    /// Present the completed shell to the surface, or to a smaller target (a
-    /// zoomed match frame) from the top-left corner.
-    ///
-    /// Native targets copy the composed sRGB bytes; the RGB565 pass is kept
-    /// for the WebGL2 fallback (see `present_by_copy`).
+    /// Quantize the completed shell and copy its encoded bytes to the surface,
+    /// or to a smaller target (a zoomed match frame) from the top-left corner.
     pub(crate) fn encode_present(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         destination: &wgpu::Texture,
     ) {
-        if self.present_by_copy {
-            self.encode_copy(encoder, destination);
-        } else {
-            self.encode_present_with_group(encoder, destination, &self.bind_group);
-        }
+        self.encode_present_with_group(encoder, destination, &self.bind_group);
     }
 
     /// Present with native 16-bit surface effects. The effects buffer is
@@ -265,42 +236,12 @@ impl ShellSurfacePresenter {
         destination: &wgpu::Texture,
         effects: SurfaceEffects,
     ) {
-        if self.present_by_copy {
-            // The effects scale RGB565 units; the composed sRGB surface has
-            // none, so the copy cannot apply them (credits roll without the
-            // native edge fade on this path).
-            self.encode_copy(encoder, destination);
-            return;
-        }
         queue.write_buffer(
             &self.effects_buffer,
             0,
             bytemuck::cast_slice(&effects.words(self.height)),
         );
         self.encode_present_with_group(encoder, destination, &self.effects_bind_group);
-    }
-
-    fn encode_copy(&self, encoder: &mut wgpu::CommandEncoder, destination: &wgpu::Texture) {
-        debug_assert_eq!(destination.format(), self.surface_format);
-        encoder.copy_texture_to_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.source_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyTextureInfo {
-                texture: destination,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::Extent3d {
-                width: destination.width().min(self.width),
-                height: destination.height().min(self.height),
-                depth_or_array_layers: 1,
-            },
-        );
     }
 
     fn encode_present_with_group(
@@ -336,7 +277,7 @@ impl ShellSurfacePresenter {
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, bind_group, &[]);
-            pass.draw(0..6, 0..1);
+            pass.draw(0..3, 0..1);
         }
 
         encoder.copy_texture_to_texture(
@@ -725,7 +666,7 @@ mod tests {
                 });
                 pass.set_pipeline(&pipeline);
                 pass.set_bind_group(0, &targets.effects_bind_group, &[]);
-                pass.draw(0..6, 0..1);
+                pass.draw(0..3, 0..1);
             }
             let readback = PendingTextureReadback::encode(
                 &device,
