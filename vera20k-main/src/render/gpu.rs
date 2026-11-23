@@ -462,8 +462,11 @@ impl GpuContext {
         // baseline is unattainable; request what the context offers, without
         // storage or compute. Desktop GL may offer both, but asking for none
         // gives the fallback the device it was written for, and renderers
-        // detect it through `webgl_fallback`.
-        let gl_fallback = adapter_info.backend == wgpu::Backend::Gl;
+        // detect it through `webgl_fallback`. OHOS only offers GL, but its
+        // surface is a full render target with storage and compute; the
+        // fallback's offscreen composition corrupts every frame there.
+        let gl_fallback =
+            adapter_info.backend == wgpu::Backend::Gl && !cfg!(target_env = "ohos");
         let required_limits = if gl_fallback {
             let webgl2 = wgpu::Limits::downlevel_webgl2_defaults();
             wgpu::Limits {
