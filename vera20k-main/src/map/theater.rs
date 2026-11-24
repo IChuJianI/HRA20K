@@ -9,11 +9,9 @@
 //! - Part of map/ — depends on assets/, rules/ (for INI parsing).
 //! - Does NOT depend on render/ or sim/.
 
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use crate::assets::asset_manager::{AssetManager, PinnedNames};
-use crate::assets::mix_archive::MixArchive;
 use crate::assets::mix_hash::mix_hash;
 use crate::assets::pal_file::Palette;
 use crate::assets::tmp_file::TmpFile;
@@ -21,6 +19,7 @@ use crate::map::bridge_rim_tiles::HighBridgeRimTiles;
 use crate::map::map_file::MapError;
 use crate::rules::ini_parser::{IniFile, IniSection};
 use crate::rules::object_image::ImageTheater;
+use crate::rules::retail_sources::{RetailArchive, registered_retail, retail_archive};
 
 /// Marker for "no tile" after raw Pack5 compatibility translation.
 ///
@@ -811,6 +810,9 @@ pub struct TheaterData {
     pub cliff_ranges: TheaterCliffRanges,
     /// Tile-identity `[General]` keys consumed by the random-map generator.
     pub rmg_tiles: RmgTileKeys,
+    /// First tiles of `[General] Ice1Set`/`Ice2Set`/`Ice3Set`, the Firestorm
+    /// ice chain's three families (docs/ts-ice.md). `None` keeps ice off.
+    pub ice_sets: Option<[u16; 3]>,
 }
 
 impl TheaterData {
@@ -996,23 +998,6 @@ pub fn changed_tiles(asset_manager: &AssetManager) -> ChangedTiles {
     }
 }
 
-/// One archive a retail install searches ([`retail_archive`]): the name its
-/// files report as their source, the game-folder source it stands in for,
-/// and the archive.
-type RetailArchive<'a> = (&'a str, Option<&'a str>, Cow<'a, MixArchive>);
-
-/// The registered archives as a retail install searches them, in their
-/// order ([`retail_archive`]).
-fn registered_retail(asset_manager: &AssetManager) -> Vec<RetailArchive<'_>> {
-    asset_manager
-        .registered_archives()
-        .filter_map(|(source, archive)| {
-            let (replaces, retail) = retail_archive(asset_manager, source, Some(archive))?;
-            Some((source, replaces, retail))
-        })
-        .collect()
-}
-
 /// A theater's archives that are not registered
 /// (`AssetManager::theater_archives_unmounted`) as a retail install searches
 /// them, after the registered ones. A loose one that does not open still
@@ -1032,24 +1017,6 @@ fn unmounted_retail<'a>(
             Some((unmounted.source.as_str(), replaces, retail))
         })
         .collect()
-}
-
-/// What a retail install searches in place of one archive (`None` when it
-/// does not open): the archive itself when it ships; else the shipped copy of
-/// the archive of its name, with the source it stands in for; else nothing
-/// (`expandmd99.mix`).
-fn retail_archive<'a>(
-    assets: &AssetManager,
-    source: &'a str,
-    archive: Option<&'a MixArchive>,
-) -> Option<(Option<&'a str>, Cow<'a, MixArchive>)> {
-    if let Some(archive) = archive.filter(|_| crate::rules::retail_sources::shipped_source(source))
-    {
-        return Some((None, Cow::Borrowed(archive)));
-    }
-    let name = source.rsplit("->").next().unwrap_or(source).trim();
-    crate::rules::retail_sources::shipped_nested_archive(assets, name)
-        .map(|copy| (Some(source), Cow::Owned(copy)))
 }
 
 /// A tile's files as a theater reads them: the pristine file and its
@@ -1235,6 +1202,7 @@ pub fn load_theater_with(
         &mut cliff_ranges,
         &mut rmg_tiles,
     );
+    let ice_sets = resolve_ice_sets(theater_name, &lookup, general);
     let high_bridge_rim_tiles = HighBridgeRimTiles::read(
         bridge_set
             .and_then(|set| lookup.bounds().get(usize::from(set)))
@@ -1263,6 +1231,7 @@ pub fn load_theater_with(
         automatic_tube_bases,
         cliff_ranges,
         rmg_tiles,
+        ice_sets,
     };
     let [bridge_middle_1, bridge_middle_2] = theater.bridge_middles();
     if bridge_set.is_some() || wood_bridge_set.is_some() {
@@ -1485,6 +1454,34 @@ pub(crate) fn resolve_rmg_tile_keys(
         paved_road_ends: resolve("PavedRoadEnds"),
         medians: resolve_tileset_start(lookup, medians_ordinal(read("Medians"))),
     }
+}
+
+/// Firestorm 2.0 Read_Theater 0x4f3950 reads `Ice1Set`, `Ice2Set`, `Ice3Set`
+/// and `IceShoreSet` with Get_Int (default -1) and keeps each set's first
+/// tile; gamemd reads none of them. Its ice code runs on every SNOW map, but
+/// classifies tiles by fixed 0x40-tile windows from those bases, so VERA runs
+/// it only where they hold real tiles: a Snow theater whose three ice sets
+/// have 0x40 tiles each and whose shore set has any. Retail SNOWMD.INI keeps
+/// all four with `TilesInSet = 0`, which leaves ice off.
+fn resolve_ice_sets(
+    theater_name: &str,
+    lookup: &TilesetLookup,
+    general: Option<&IniSection>,
+) -> Option<[u16; 3]> {
+    if ImageTheater::from_name(theater_name) != ImageTheater::Snow {
+        return None;
+    }
+    let bounds = |key: &str| {
+        let ordinal = general?.read_int(key, -1);
+        lookup.bounds().get(usize::try_from(ordinal).ok()?).copied()
+    };
+    let ice = |key: &str| {
+        bounds(key)
+            .filter(|set| set.count >= 0x40)
+            .map(|set| set.start)
+    };
+    bounds("IceShoreSet").filter(|set| set.count > 0)?;
+    Some([ice("Ice1Set")?, ice("Ice2Set")?, ice("Ice3Set")?])
 }
 
 /// The `[General] Medians=` ordinal ReadTheater545150 keeps. Ares' MediansFix

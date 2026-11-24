@@ -21,15 +21,14 @@ use crate::render::shell_paint::{
 use crate::ui::campaign_shell::{CAMPAIGN_PAGE, CampaignLayout, CampaignSide, DIFFICULTY_MAX};
 use crate::ui::shell::geom::ShellAlign;
 use crate::ui::shell::geom::{RectPx, centred_in_window};
-use vera20k_gui::shell::trackbar::thumb_left;
+use vera20k_gui::shell::trackbar::TrackbarRange;
 
-/// Frame counts of the two emblems (FSALG / FSSLG, or the 640 set).
-pub(crate) fn emblem_frame_counts(state: &AppState) -> [usize; 2] {
-    state
-        .frontend
-        .campaign_art
-        .as_ref()
-        .map_or([0, 0], |art| [art.allied.len(), art.soviet.len()])
+/// Frame counts of the emblems (Allied / Soviet / Boot Camp). Boot Camp is
+/// empty under YR, which has only two emblems.
+pub(crate) fn emblem_frame_counts(state: &AppState) -> [usize; 3] {
+    state.frontend.campaign_art.as_ref().map_or([0, 0, 0], |art| {
+        [art.allied.len(), art.soviet.len(), art.bootcamp.len()]
+    })
 }
 
 /// The difficulty trackbar (`0x0061D950` paint): the area it saved under
@@ -58,7 +57,8 @@ fn push_slider(
         );
     }
     if let Some(thumb) = art.slider_thumb {
-        let x = slider.x + thumb_left(position, slider.w, 0, DIFFICULTY_MAX);
+        let range = TrackbarRange::new(0, DIFFICULTY_MAX, 1).with_plaque(false);
+        let x = slider.x + range.thumb_left(position, slider.w);
         let y = slider.y + (slider.h - 22) / 2;
         push_entry_scaled(out, thumb, x, y, scale, STATIC_IMAGE_DEPTH - 0.00001);
     }
@@ -111,10 +111,11 @@ fn campaign_sprites(
         background_origin,
         campaign.difficulty(),
     );
-    for side in CampaignSide::ALL {
+    for &side in CampaignSide::active() {
         let frames = match side {
             CampaignSide::Allied => &art.allied,
             CampaignSide::Soviet => &art.soviet,
+            CampaignSide::BootCamp => &art.bootcamp,
         };
         let Some(entry) = frames.get(campaign.emblem(side).shown_frame()).copied() else {
             continue;
@@ -141,10 +142,12 @@ fn campaign_labels<'a>(
         rgb: SHELL_TEXT_RGB_ENABLED,
         path_a_reveal: None,
     };
-    let captions = CampaignSide::ALL.map(|side| {
+    // Original RA2 shows a third Boot Camp caption; YR shows only the two
+    // campaign emblems. `active()` returns three under `-ra2`, two otherwise.
+    let captions = CampaignSide::active().iter().map(|side| {
         label(
             side.caption_key(),
-            layout.caption(side),
+            layout.caption(*side),
             ShellAlign::H_CENTER,
         )
     });
@@ -156,7 +159,7 @@ fn campaign_labels<'a>(
             ShellAlign::H_RIGHT,
         ),
     ];
-    captions.into_iter().chain(difficulty).collect()
+    captions.chain(difficulty).collect()
 }
 
 /// Paint dialog `0x94`. Returns `false` when its art is missing.

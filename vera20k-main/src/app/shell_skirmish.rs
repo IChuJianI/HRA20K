@@ -296,7 +296,7 @@ impl App {
     }
 
     pub(crate) fn ensure_skirmish_shell_chrome(state: &mut AppState) -> bool {
-        let yr_original_style = state.persistence.options_profile.yr_original_style;
+        let yr_original_style = state.persistence.options_profile.plays_yr_original_style();
         if state
             .frontend
             .skirmish_shell_chrome
@@ -481,7 +481,10 @@ impl App {
             &state.frontend.skirmish_shell_state,
             state.frontend.scenario_catalog.shell_maps(),
             &state.frontend.skirmish_modes,
-            state.persistence.options_profile.solo_skirmish,
+            crate::ui::skirmish_shell::start_skips_side_gates(
+                state.persistence.options_profile.solo_skirmish,
+                state.frontend.frontend_rules.as_ref(),
+            ),
         ) {
             Ok(raw_session) => {
                 match state
@@ -1011,10 +1014,7 @@ impl App {
         let (w, h) = (state.render_width() as i32, state.render_height() as i32);
         let parts = shell_box.parts(w, h, crate::ui::shell::geom::RETAIL_SCALE);
         let controller = &mut state.frontend.shell_controller;
-        if controller.top_id() != Some(shell_box.dialog) {
-            controller.close(shell_box.dialog);
-            controller.push_modal(shell_box.dialog);
-        }
+        Self::raise_choose_map_prompt(controller, shell_box.dialog);
         crate::ui::shell::menu_page::sync_nodes(
             controller,
             shell_box.dialog,
@@ -1029,6 +1029,17 @@ impl App {
             controller.set_prop(shell_box.dialog, b.id, Prop::Cancel, cancel);
         }
         Some((prompt, shell_box))
+    }
+
+    /// Use Map's box `dialog` on top of the controller, over the chooser.
+    pub(crate) fn raise_choose_map_prompt(
+        controller: &mut crate::ui::shell::controller::DialogController,
+        dialog: crate::ui::shell::descriptor::DialogResourceId,
+    ) {
+        if controller.top_id() != Some(dialog) {
+            controller.close(dialog);
+            controller.push_modal(dialog);
+        }
     }
 
     /// A pointer message (`down`; `None` moves) while Use Map's box shows:

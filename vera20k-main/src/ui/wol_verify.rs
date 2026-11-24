@@ -17,7 +17,7 @@ use crate::ui::shell::page::{self, PageEvent};
 use crate::ui::wol_shell::BOX_OK;
 use crate::util::time::Instant;
 use std::ops::Range;
-use vera20k_gui::shell::list::{ListMetrics, ListScrollPart, ShellListGeometry};
+use vera20k_gui::shell::list::{ListMetrics, ShellListGeometry};
 
 /// VERA's room shows `0x130` only once the connection check has taken this
 /// long, so a quick check does not flash a box before the loading screen.
@@ -28,7 +28,10 @@ pub const BOXES: [u16; 8] = [0x769, 0x761, 0x764, 0x762, 0x765, 0x768, 0x766, 0x
 
 const DIALOG: DialogResourceId = DialogResourceId(0x0130);
 /// The list whose scrollbar moves the boxes past eight nodes.
-const LIST: u16 = 0x0200;
+pub const LIST: u16 = 0x0200;
+/// The SS_CENTER title `GUI:ConnectingToPlayers`, a static that takes no
+/// pointer.
+pub const TITLE: u16 = 0x0300;
 /// Node `node`'s box widget (by node, not by template id: past eight nodes
 /// the template has none).
 const fn node_box(node: usize) -> u16 {
@@ -63,11 +66,16 @@ impl WolVerifyDialog {
             .id(i32::from(LIST))
             .with(Prop::RowCount, Value::Int(count as i32));
         let ok = NodeSpec::new(NodeKind::Button).id(i32::from(BOX_OK));
+        let centre = i32::from(crate::ui::shell::geom::ShellAlign::H_CENTER.0);
+        let title = NodeSpec::new(NodeKind::Text)
+            .id(i32::from(TITLE))
+            .with(Prop::Align, Value::Int(centre));
         // The first node under the pointer takes it: the boxes over the list.
         let spec = NodeSpec::new(NodeKind::Dialog)
             .children(boxes)
             .child(ok)
-            .child(list);
+            .child(list)
+            .child(title);
         if let Some(root) = ui.root_in(DIALOG) {
             page::ensure_built(ui.gui_mut(), root, || spec);
         }
@@ -101,15 +109,21 @@ impl WolVerifyDialog {
         }
         let first = layout.boxes[0];
         let last = layout.boxes[BOXES.len() - 1];
-        let outer = RectPx::new(
-            first.x - 1,
-            first.y - 1,
-            first.w + 2,
-            last.y + last.h - first.y + 2,
-        );
+        // Template checkbox windows are slightly taller than their pitch.
+        // Derive a uniform pitch from the scaled row starts, not the check
+        // window height. The shared list uses a device-pixel inset per edge.
+        let gaps = (BOXES.len() - 1) as i32;
+        let (row_h, inner_h) = if layout.scale.is_unscaled() {
+            // Preserve the native-size extended viewport as it was.
+            (first.h, last.y + last.h - first.y)
+        } else {
+            let pitch = ((last.y - first.y + gaps / 2) / gaps).max(1);
+            (pitch, pitch * BOXES.len() as i32)
+        };
+        let outer = RectPx::new(first.x - 1, first.y - 1, first.w + 2, inner_h + 2);
         let metrics = ListMetrics {
-            row_h: first.h,
-            ..ListMetrics::RETAIL
+            row_h,
+            ..ListMetrics::scaled(layout.scale)
         };
         let top = self.list().map_or(0, |view| view.top);
         Some(ShellListGeometry::new(
@@ -139,10 +153,6 @@ impl WolVerifyDialog {
         })
     }
 
-    /// The scrollbar arrow drawn pushed.
-    pub fn pressed_scroll_part(&self) -> Option<ListScrollPart> {
-        self.list()?.pressed
-    }
 
     /// Whether the mismatch box's OK shows pushed (captured and under the
     /// pointer, 612B70).
@@ -153,24 +163,60 @@ impl WolVerifyDialog {
             .is_some_and(|node| gui.id_of(node) == Some(i32::from(BOX_OK)))
     }
 
+    /// [`Self::sync`] before the widgets paint: input syncs them only on a
+    /// pointer message.
+    pub fn sync_widgets(&mut self, layout: &WolVerifyLayout, ok: RectPx) {
+        self.sync(layout, ok);
+    }
+
+    /// The mismatch box on `parts` in the dialog's widgets while it is up
+    /// ([`ShellBox::sync`]), its body hidden otherwise: the one tree its OK
+    /// takes the pointer on and the box paints from.
+    pub fn sync_mismatch(&mut self, parts: Option<&crate::ui::shell::modal::BoxParts>) {
+        let Some(root) = self.ui.root_in(DIALOG) else {
+            return;
+        };
+        let gui = self.ui.gui_mut();
+        match (&self.mismatch, parts) {
+            (Some(message), Some(parts)) => message.sync(gui, root, parts),
+            _ => crate::ui::shell::modal::hide_body(gui, root),
+        }
+    }
+
+    /// The dialog's widgets: their gui and its root.
+    pub fn widgets(&self) -> Option<(&vera20k_gui::Gui, vera20k_gui::NodeId)> {
+        Some((self.ui.gui(), self.ui.root_in(DIALOG)?))
+    }
+
+    /// The session node whose box widget is `id`.
+    pub fn node_of(&self, id: u16) -> Option<usize> {
+        let node = usize::from(id.checked_sub(node_box(0))?);
+        (node < self.names.len()).then_some(node)
+    }
+
     /// Puts the widgets on `layout`: the box's OK on `ok` while the
-    /// mismatch box is up, else the visible boxes and the list.
+    /// mismatch box is up, else the title, the visible boxes and the list.
     fn sync(&mut self, layout: &WolVerifyLayout, ok: RectPx) {
         let Some(root) = self.ui.root_in(DIALOG) else {
             return;
         };
-        let row_h = Value::Int(layout.boxes[0].h);
-        page::set(self.ui.gui_mut(), root, LIST, Prop::RowHeight, row_h);
+        self.ui.set_scale(layout.scale);
         let boxed = self.mismatch.is_some();
-        let list = self.list_geometry(layout).map(|geometry| geometry.outer);
+        let list = self.list_geometry(layout);
+        if let Some(geometry) = list {
+            let row_h = Value::Int(geometry.metrics.row_h);
+            page::set(self.ui.gui_mut(), root, LIST, Prop::RowHeight, row_h);
+        }
         let boxes: Vec<_> = (0..self.names.len())
             .map(|node| self.node_rect(layout, node))
             .collect();
+        let title = layout.title;
         let gui = self.ui.gui_mut();
         page::sync_rects(gui, root, |id| match id {
             BOX_OK => boxed.then_some(ok),
             _ if boxed => None,
-            LIST => list,
+            TITLE => Some(title),
+            LIST => list.map(|geometry| geometry.outer),
             id => boxes
                 .get(usize::from(id.wrapping_sub(node_box(0))))
                 .copied()
@@ -277,8 +323,17 @@ mod tests {
     }
     #[test]
     fn thirty_connected_nodes_survive_scroll_and_clicks_use_logical_identity() {
+        for (w, h) in [(320, 240), (800, 600), (1024, 768), (1600, 1200)] {
+            assert_roster_pointer_at_size(w, h);
+        }
+    }
+
+    fn assert_roster_pointer_at_size(w: i32, h: i32) {
+        use crate::ui::shell::{geom, modal::wol_verify_layout};
+
         let mut dialog = WolVerifyDialog::open((0..30).map(|n| format!("Player{n}")).collect());
-        let layout = crate::ui::shell::modal::wol_verify_layout(800, 600);
+        let scale = geom::shell_scale_for_window(w, h);
+        let layout = wol_verify_layout(w, h, scale);
         let ok = RectPx::default();
         let click = |dialog: &mut WolVerifyDialog, at| {
             dialog.pointer(&layout, ok, at, Some(true));
@@ -289,6 +344,10 @@ mod tests {
         assert!(dialog.node_rect(&layout, 29).is_none());
         let geometry = dialog.list_geometry(&layout).unwrap();
         let bar = geometry.scrollbar.unwrap();
+        if !scale.is_unscaled() {
+            assert_eq!(geometry.visible_rows, BOXES.len());
+        }
+        assert_eq!(bar.w, ListMetrics::scaled(scale).scrollbar_w);
         // The ordinary scrollbar track, then its release.
         click(
             &mut dialog,
@@ -297,6 +356,9 @@ mod tests {
         let visible = dialog.visible_nodes(&layout);
         assert!(visible.start > 0 && visible.contains(&29));
         assert!(dialog.checked()[29]);
+        let last = dialog.node_rect(&layout, 29).unwrap();
+        click(&mut dialog, (last.x + 1, last.y + 1));
+        assert!(!dialog.checked()[29], "the last rendered row is clickable");
         let first = visible.start;
         dialog.connect(first);
         let rect = dialog.node_rect(&layout, first).unwrap();

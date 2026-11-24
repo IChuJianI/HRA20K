@@ -134,6 +134,11 @@ impl Simulation {
             );
         let input_z = if let Some(input_z) = position.exact_z_leptons() {
             input_z
+        } else if entity.on_bridge()
+            && let Some(deck) = terrain
+                .corrected_high_bridge_deck_level(((xy[0] / 256) as u16, (xy[1] / 256) as u16))
+        {
+            i32::from(deck).wrapping_mul(LEPTONS_PER_LEVEL as i32)
         } else if entity.on_bridge() && i32::from(position.z() as i8) == i32::from(level) + 4 {
             // VERA input adapter: retain the ramp remainder that the existing
             // coarse bridge-level API cannot carry. Native clamp remains max.
@@ -554,18 +559,20 @@ impl Simulation {
             .get(stable_id)
             .is_some_and(|entity| entity.category() == EntityCategory::Unit)
         {
-            let visceroid = self
-                .substrate
-                .entities
-                .get(stable_id)
-                .and_then(|entity| {
-                    self.interner.object_type_in_category(
-                        entity.type_ref(),
-                        entity.category().into(),
-                        context.rules(),
-                    )
-                })
-                .is_some_and(|object| object.small_visceroid || object.large_visceroid);
+            let object = self.substrate.entities.get(stable_id).and_then(|entity| {
+                self.interner.object_type_in_category(
+                    entity.type_ref(),
+                    entity.category().into(),
+                    context.rules(),
+                )
+            });
+            let visceroid =
+                object.is_some_and(|object| object.small_visceroid || object.large_visceroid);
+            // Firestorm 2.0 `UnitClass::Unlimbo @ 0x0064F790` also starts a
+            // Tiberian Sun Limpet Drone's Stage at 0, rate 1, after the same
+            // visceroid test (`0x0064F808`, `0x0064F83D..0x0064F85E`); its
+            // body draws that Stage (`sim::limpet::wrap_drone_stage`).
+            let drone = object.is_some_and(|object| object.is_limpet_drone);
             let value = if visceroid {
                 self.scenario_rng.next_range_i32_inclusive(0, 29)
             } else {
@@ -575,7 +582,7 @@ impl Simulation {
                 entity.restart_native_stage(
                     value,
                     self.session.binary_frame() as i32,
-                    i32::from(visceroid),
+                    i32::from(visceroid || drone),
                 );
             }
         }
@@ -633,14 +640,14 @@ impl Simulation {
             })
         {
             let terrain = context.terrain().or(self.resolved_terrain.as_ref());
-            let ground = crate::sim::movement::ground_pose::ground_surface_z_at(
+            let deck = crate::sim::movement::ground_pose::ground_surface_z_at(
                 [coord.x, coord.y],
-                false,
+                true,
                 terrain,
                 None,
             )
-            .unwrap_or(coord.z);
-            if coord.z <= ground.wrapping_add(BRIDGE_DECK_HEIGHT_LEPTONS) {
+            .unwrap_or_else(|| coord.z.wrapping_add(BRIDGE_DECK_HEIGHT_LEPTONS));
+            if coord.z <= deck {
                 crate::sim::movement::walk_head::raw_at(
                     &mut self.substrate.raw_cell_occupation,
                     owner,

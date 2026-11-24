@@ -669,10 +669,20 @@ fn projectile_aa(rules: &RuleSet, weapon: &WeaponType) -> bool {
 /// ORs `0xB8`. A weapon naming no projectile section reads the reader's
 /// defaults (AA=no, AG=yes), as weapon selection does; retail weapons always
 /// name one.
+///
+/// Tiberian Sun's `AV=` (docs/ts-limpets.md) comes first: Firestorm 2.0
+/// `WeaponTypeClass::Allowable_Threat @ 0x00681150` answers only `0x10`
+/// (vehicles, the same bit in gamemd's mask) for an AV projectile
+/// (`0x00681153..0x00681162`), whatever its AA and AG say.
 fn weapon_class_bits(rules: &RuleSet, weapon: &WeaponType) -> u32 {
-    let (aa, ag) = rules
+    let (aa, ag, av) = rules
         .weapon_projectile(weapon)
-        .map_or((false, true), |projectile| (projectile.aa, projectile.ag));
+        .map_or((false, true, false), |projectile| {
+            (projectile.aa, projectile.ag, projectile.av)
+        });
+    if av {
+        return 0x10;
+    }
     let mut bits = 0;
     if aa {
         bits = 4;
@@ -1307,11 +1317,13 @@ fn occupant_weapon_record(occupant: &ObjectType, veterancy: u16) -> Option<Weapo
 /// `BuildingClass::IsOccupied @ 0x00458DD0` (vt+0x400; every other class
 /// answers false through `0x0041BFB0`): a building whose type is
 /// `CanBeOccupied=` (`+0x157B`) and `CanOccupyFire=` (`+0x157C`), holding an
-/// occupant (vt+0x408, `+0x694`).
+/// occupant (vt+0x408, `+0x694`). Original RA2 has no `CanOccupyFire=`:
+/// in RA2 Mode `CanBeOccupied=` alone arms the garrison, with the gun on the
+/// building's own Primary/Secondary ([`ObjectType::occupants_fire`]).
 pub(crate) fn is_occupied(entity: &GameEntity, obj: &ObjectType) -> bool {
     entity.category() == EntityCategory::Structure
         && obj.can_be_occupied
-        && obj.can_occupy_fire
+        && obj.occupants_fire()
         && entity.passenger_role().occupants().count() > 0
 }
 
@@ -1327,6 +1339,17 @@ pub(crate) fn half_foundation(obj: &ObjectType) -> i32 {
 /// range with it shifted to leptons (`0x006F7288..0x006F729F`), and
 /// Greatest_Threat walks one ring beyond it (`0x006F9189..0x006F91A3`).
 pub(crate) fn occupied_reach_cells(obj: &ObjectType, rules: &RuleSet) -> i32 {
+    if rules.ra2() {
+        // Original RA2 has no [CombatDamage] OccupyWeaponRange override: the
+        // garrison gun keeps its own WeaponType Range (AlliedOccupyW /
+        // SovietOccupyW are Range=7). Use the building's Primary slot range in
+        // cells, matching the gun `get_weapon_record` resolves for index 0.
+        if let Some(id) = obj.weapon_at(0)
+            && let Some(weapon) = rules.weapon(id)
+        {
+            return weapon.range_leptons.wrapping_shr(8);
+        }
+    }
     half_foundation(obj).wrapping_add(rules.garrison_rules.occupy_weapon_range)
 }
 
@@ -1397,6 +1420,15 @@ pub(crate) fn get_weapon_record<'r>(
         }
     }
     if let Some(id) = firing_occupant_id(entity, obj) {
+        if rules.ra2() {
+            // Original RA2 keeps the garrison gun on the building itself
+            // (e.g. [CARUS03] Primary=AlliedOccupyW, Secondary=SovietOccupyW).
+            // The occupant only supplies the trigger; its own weapon dict is
+            // not consulted. Resolve through the building's slot so the
+            // native Per Index selection and FLH stay intact.
+            return weapon_for_index(obj, entity.veterancy.rank(), index)
+                .or_else(|| weapon_for_index(obj, entity.veterancy.rank(), 0));
+        }
         let occupant = entities.get(id)?;
         let kind = interner.object_type_in_category(
             occupant.type_ref(),

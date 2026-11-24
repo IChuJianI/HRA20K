@@ -97,19 +97,27 @@ fn reason(state: &AppState) -> Option<String> {
 }
 
 /// VERA: a refused start also names what this game changes from the
-/// original game, the terrain files this match read among them, or says it
-/// plays the original (`agreement::start_changes_text`), and a launcher's
+/// original game, the terrain and picture or model files this match read and
+/// the Ares setting Off where it kept Ares from playing among them, or says
+/// it plays the original (`agreement::start_changes_text`), and a launcher's
 /// match points at the launcher, which compares every player's rules parts
-/// (docs/spawn.md). Those parts leave the terrain files out, so a match that
-/// read them does not point there.
+/// (docs/spawn.md). Those parts leave the terrain files, the picture and
+/// model files and that Ares answer out, so a match that read such files or
+/// has that answer does not point there.
 fn start_mismatch_text(state: &AppState) -> String {
-    use crate::app::shell_network_setup::agreement::start_changes_text;
+    use crate::app::shell_network_setup::agreement::{
+        match_keeps_ares_off, match_picture_files, start_changes_text,
+    };
     let mut text = crate::i18n::tr("VERA:MatchStartMismatch");
     text.push_str("\n\n");
     text.push_str(
         &start_changes_text(state).unwrap_or_else(|| crate::i18n::tr("VERA:RulesDifferOriginal")),
     );
-    if state.frontend.external_launch && !state.process_assets.match_reads_folder_terrain() {
+    if state.frontend.external_launch
+        && !state.process_assets.match_reads_folder_terrain()
+        && !match_keeps_ares_off(state)
+        && match_picture_files(state).is_empty()
+    {
         text.push('\n');
         text.push_str(&crate::i18n::tr("VERA:LauncherShowsMismatch"));
     }
@@ -152,6 +160,29 @@ pub(crate) fn hold_quit_line(state: &mut AppState) {
     }
 }
 
+/// The box's widgets: OK, its default and cancel button.
+fn nodes() -> NodeSpec {
+    NodeSpec::new(NodeKind::Dialog).child(
+        NodeSpec::new(NodeKind::Button)
+            .id(control::OK.into())
+            .with(Prop::Default, Value::Bool(true))
+            .with(Prop::Cancel, Value::Bool(true)),
+    )
+}
+
+/// `shell_box` on `parts` in the widgets its input routes to, before it
+/// paints ([`crate::ui::shell::modal::ShellBox::sync`]).
+pub(crate) fn sync_box(
+    state: &mut AppState,
+    shell_box: &crate::ui::shell::modal::ShellBox,
+    parts: &crate::ui::shell::modal::BoxParts,
+) {
+    let controller = &mut state.frontend.shell_controller;
+    let rect = |id| (id == control::OK).then(|| parts.button(0));
+    let sync = |gui: &mut vera20k_gui::Gui, root| shell_box.sync(gui, root, parts);
+    dialog_page::sync_dialog(controller, DIALOG, nodes, rect, sync);
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct NetworkFailureModal {
     acknowledged: bool,
@@ -168,14 +199,6 @@ impl NetworkFailureModal {
         event: InputEvent,
         ok: RectPx,
     ) -> Vec<PageEvent> {
-        let nodes = || {
-            NodeSpec::new(NodeKind::Dialog).child(
-                NodeSpec::new(NodeKind::Button)
-                    .id(control::OK.into())
-                    .with(Prop::Default, Value::Bool(true))
-                    .with(Prop::Cancel, Value::Bool(true)),
-            )
-        };
         let rect = |id| (id == control::OK).then_some(ok);
         let events =
             dialog_page::route(controller, DIALOG, nodes, rect, dialog_page::no_sync, event);
@@ -216,11 +239,7 @@ pub(crate) fn show(state: &mut AppState) {
         state.match_state.network_failure = Some(NetworkFailureModal::default());
         state.match_state.input.cancel_tactical_drag();
         state.match_state.input.keys_held.clear();
-        state
-            .match_state
-            .match_presentation
-            .in_game_gadgets
-            .cancel_pointer_capture();
+        crate::app::input::chrome_input::cancel(state);
     }
     state.frontend.shell_controller.ensure_active(DIALOG);
     state.platform.window.request_redraw();

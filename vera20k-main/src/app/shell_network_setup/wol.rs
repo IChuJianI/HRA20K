@@ -773,8 +773,30 @@ fn screen(state: &AppState) -> (i32, i32) {
 
 /// `0x130`'s layout on the live screen.
 pub(crate) fn verify_layout(state: &AppState) -> crate::ui::shell::modal::WolVerifyLayout {
+    use crate::app::frontend::shell_layout;
+    use crate::ui::shell::geom::RETAIL_SCALE;
+
     let (width, height) = screen(state);
-    crate::ui::shell::modal::wol_verify_layout(width, height)
+    let scale = if !setup_dialog(state, false, SetupFlavor::Wol).modern {
+        RETAIL_SCALE
+    } else if super::quick_match(state) {
+        // Quick Match has no C2/C9 room; its backdrop uses the fitted WOL shell.
+        shell_layout::shell_scale_for_screen((width as u32, height as u32))
+    } else {
+        crate::app::input::multiplayer_setup::page_layout(state)
+            .page
+            .scale
+    };
+    crate::ui::shell::modal::wol_verify_layout(width, height, scale)
+}
+
+/// The 0xD0 mismatch is a separate retail message box; do not resize it here.
+pub(crate) fn verify_mismatch_parts(
+    state: &AppState,
+    message: &crate::ui::shell::modal::ShellBox,
+) -> crate::ui::shell::modal::BoxParts {
+    let (width, height) = screen(state);
+    message.parts(width, height, crate::ui::shell::geom::RETAIL_SCALE)
 }
 
 /// The pointer while `0x130` is up (`down`: `None` moves): the mismatch
@@ -783,8 +805,10 @@ pub(crate) fn verify_layout(state: &AppState) -> crate::ui::shell::modal::WolVer
 pub(crate) fn verify_pointer(state: &mut AppState, down: Option<bool>) {
     use crate::ui::shell::page::PageEvent;
     let at = state.match_state.input.cursor_px();
-    let (width, height) = screen(state);
-    let ok = crate::ui::shell::modal::menu_message_box(1, width, height).button(0);
+    let ok = verify(state)
+        .and_then(|verify| verify.mismatch.as_ref())
+        .map(|message| verify_mismatch_parts(state, message).button(0))
+        .unwrap_or_default();
     let layout = verify_layout(state);
     let Ok(verify) = verify_mut(state) else {
         return;
@@ -793,6 +817,23 @@ pub(crate) fn verify_pointer(state: &mut AppState, down: Option<bool>) {
     let events = App::play_page_cues(state, events, false);
     if events.contains(&PageEvent::Activated(crate::ui::wol_shell::BOX_OK)) {
         mismatch_ok(state);
+    }
+}
+
+/// `0x130`'s widgets on its layout before they paint (input syncs them only
+/// on a pointer message).
+pub(crate) fn verify_sync(state: &mut AppState) {
+    let Some(shown) = verify(state) else {
+        return;
+    };
+    let parts = Some(shown)
+        .and_then(|verify| verify.mismatch.as_ref())
+        .map(|message| verify_mismatch_parts(state, message));
+    let ok = parts.as_ref().map(|parts| parts.button(0)).unwrap_or_default();
+    let layout = verify_layout(state);
+    if let Ok(verify) = verify_mut(state) {
+        verify.sync_widgets(&layout, ok);
+        verify.sync_mismatch(parts.as_ref());
     }
 }
 
@@ -872,14 +913,7 @@ pub(super) fn emote(state: &mut AppState) {
 }
 
 fn csf_units(state: &AppState, key: &str) -> Vec<u16> {
-    state
-        .process_assets
-        .csf
-        .as_ref()
-        .and_then(|csf| csf.get(key))
-        .unwrap_or_default()
-        .encode_utf16()
-        .collect()
+    state.csf_label(key, "").encode_utf16().collect()
 }
 
 /// `00B73E40` is the login nickname, which the login made the MultiPlayer

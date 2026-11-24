@@ -290,6 +290,10 @@ fn unit_shadow_slope(
     cells: Option<&crate::map::resolved_terrain::NativeCellQuery<'_>>,
     entity: &crate::app::presentation::frame::ObjectRecord,
 ) -> u8 {
+    // A shadow on the high deck follows its level surface.
+    if entity.on_bridge() {
+        return 0;
+    }
     let [x, y] = crate::sim::movement::ground_pose::position_world_xy(&entity.position);
     clamp_slope_for_render(cells.map_or(0, |cells| cells.ground_fields(cells.lookup_world(x, y)).1))
 }
@@ -313,7 +317,7 @@ fn unit_render_slope_state(
     if let Some(slope_state) = locomotor_render_slope_state(entity, display_binary_frame) {
         return slope_state;
     }
-    if entity.category() == EntityCategory::Aircraft {
+    if entity.on_bridge() || entity.category() == EntityCategory::Aircraft {
         return UnitRenderSlopeState::Stable(0);
     }
     let kind = entity
@@ -2925,7 +2929,8 @@ struct HarvestOverlay<'a> {
 /// `0x0073D114`: Drive `0x004AFC20`, rotating or moving with speed), and that
 /// no Temporal weapon is warping (`+0x278`), warping out (vt+0x1D4) or warping
 /// in (vt+0x1D8) (`0x0073D0DB..0x0073D221`). So a miner hopping to its next
-/// ore cell shows none.
+/// ore cell shows none. With Ares, UnitClass_Draw_OreGatherAnim (Ares.dll
+/// `10053E50`, hook `0x0073D219`) also refuses one under EMP (vt+0x37C).
 fn harvest_overlay<'a>(
     rules: Option<&'a crate::rules::ruleset::RuleSet>,
     sim: &crate::sim::world::Simulation,
@@ -2942,6 +2947,7 @@ fn harvest_overlay<'a>(
         || entity.temporal.is_warped()
         || entity.is_warped_out()
         || entity.is_warping_in()
+        || (rules.ares() && entity.is_under_emp())
         || {
             // Captured at the frame before the committed one.
             let _ = display_binary_frame;

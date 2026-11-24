@@ -1083,7 +1083,10 @@ fn firepower_stages(
         // `vt+0x400`: BuildingClass `0x00458DD0`, CanBeOccupied &&
         // CanOccupyFire && an occupant for FireAt; Phobos' Bullet-init
         // helper applies the same type flags without requiring an occupant.
-        occupied: is_garrison.then(|| f32_bits(multipliers.occupy_damage_multiplier)),
+        // Original RA2 has no OccupyDamageMultiplier: the garrison gun deals
+        // its plain WeaponType damage. YR applies the global multiplier.
+        occupied: (!rules.ra2() && is_garrison)
+            .then(|| f32_bits(multipliers.occupy_damage_multiplier)),
         // `+0x2E4` on a non-building: a unit installed in a Tank Bunker.
         bunkered: firer
             .filter(|firer| firer.category() != EntityCategory::Structure)
@@ -1418,6 +1421,16 @@ pub(crate) fn snapshot_get_rof(
                 crate::rules::object_type::Ability::Rof,
             ),
             veteran_rof: rules.general.veteran_rof,
+            // `TechnoClass::GetROF` divides the occupied building's ROF by
+            // its occupant count in BOTH game.exe (RA2) and gamemd.exe (YR):
+            // that signed IDIV is the sole mechanism that makes a full
+            // garrison fire faster than a single occupant. RA2 differs only
+            // in WHICH gun fires (the building's own Primary, see
+            // get_weapon_record), not in how the garrison ROF is scaled.
+            // Suppressing the divisor under -ra2 left every garrison firing
+            // at a lone occupant's cadence regardless of how many troops
+            // were inside. OccupyROFMultiplier= is a YR/Ares rule absent from
+            // retail RA2, so keep its RA2 value at identity (1.0).
             occupants: snap.garrison.as_ref().map(|gs| gs.occupant_count),
             bunkered: snap.category != EntityCategory::Structure
                 && firer.is_some_and(|firer| {
@@ -1520,6 +1533,15 @@ pub(super) fn emit_admitted_fire(
     // that launch no bullet.
     #[cfg(feature = "phobos")]
     world.record_phobos_attach_firing(snap.stable_id, rules);
+    // Firestorm 2.0 `TechnoClass::Fire_At @ 0x006301A0` takes a Tiberian Sun
+    // limpet shot (`LimpetFactor=`) before any other work, returning NULL
+    // (`sim::limpet`). gamemd has no such arm; it is here, past FireAt's
+    // limbo gate, so a target in limbo takes no limpet.
+    if let TargetKind::Entity(target) = snap.target
+        && world.limpet_fire_at(rules, snap.stable_id, target, weapon, effects)
+    {
+        return None;
+    }
     if weapon.suicide {
         // Techno6FDDC0..6FDE0E: the local packet is type Strength, not
         // current Health or weapon Damage. The real self receiver completes
@@ -2131,6 +2153,7 @@ pub(super) fn emit_admitted_fire(
             snap.garrison.is_some(),
             in_open_transport,
             rules.ares(),
+            rules.ra2(),
         )
         .map(|name| world.interner.intern(name)),
         occupied_building: snap.garrison.is_some(),

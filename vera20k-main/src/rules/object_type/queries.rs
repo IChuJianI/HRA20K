@@ -1617,6 +1617,13 @@ impl ObjectType {
         self.silo_damage
     }
 
+    /// Whether occupants fire from this building: `CanOccupyFire=`
+    /// (`+0x157C`), or in RA2 Mode, which has no such key, always
+    /// ([`Self::ra2_occupy_fire`]). `IsOccupied` and GetFireError's B1 read it.
+    pub(crate) fn occupants_fire(&self) -> bool {
+        self.can_occupy_fire || self.ra2_occupy_fire
+    }
+
     /// Store the type's `SiloDamage=` resolved in `art`.
     pub(crate) fn project_silo_damage(&mut self, art: &crate::rules::art_data::ArtRegistry) {
         self.silo_damage = self.art_silo_damage(art);
@@ -1652,6 +1659,16 @@ impl ObjectType {
     /// `Foundation::dimensions` already answers.
     pub fn is_1x1_with_undeploy(&self) -> bool {
         self.undeploys_into.is_some() && self.foundation.dimensions() == (1, 1)
+    }
+
+    /// YRpp `BuildingTypeClass::CanTogglePower`, inlined in DetermineAction's
+    /// power arm (`0x0069286F..0x00692891`) and Ares 3.0's (`1005C790`):
+    /// `TogglePower=` (`+0x154A`) with a positive drain (`+0xEE4`) or
+    /// `Powered=` (`+0x1573`).
+    pub fn can_toggle_power(&self) -> bool {
+        self.toggle_power
+            && (crate::sim::power_system::native_building_power_drain(self.power) > 0
+                || self.powered)
     }
 
     /// BuildingClass::CanBeSelectedNow's type test (`0x00459C03`): whether a

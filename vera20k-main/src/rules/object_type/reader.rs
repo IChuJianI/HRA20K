@@ -805,6 +805,10 @@ impl ObjectType {
             balloon_hover: section.read_bool("BalloonHover", false),
             target_laser: section.read_bool("TargetLaser", false),
             is_simple_deployer: section.read_bool("IsSimpleDeployer", false),
+            is_limpet_mine: category == ObjectCategory::Building
+                && section.read_bool("IsLimpetMine", false),
+            is_limpet_drone: category == ObjectCategory::Vehicle
+                && section.read_bool("IsLimpetDrone", false),
             small_visceroid: category == ObjectCategory::Vehicle
                 && section.read_bool("SmallVisceroid", false),
             large_visceroid: category == ObjectCategory::Vehicle
@@ -953,6 +957,8 @@ impl ObjectType {
             crate_beneath_is_money: category == ObjectCategory::Building
                 && section.read_bool("CrateBeneathIsMoney", false),
             can_occupy_fire: section.read_bool("CanOccupyFire", false),
+            // Decided by the RuleSet at load.
+            ra2_occupy_fire: false,
             show_occupant_pips: section.read_bool("ShowOccupantPips", true),
             bridge_repair_hut: section.read_bool("BridgeRepairHut", false),
             laser_fence: section.read_bool("LaserFence", false),
