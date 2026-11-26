@@ -65,7 +65,7 @@ HRA20K 以 GNU GPL v3 发布，全文见 [LICENSE](LICENSE)。本仓库即其对
 | Noto / GNU Unifont | 界面字体 | SIL OFL 1.1 | https://github.com/notofonts · https://unifoundry.com/unifont/ |
 | Rust（含 LLVM libunwind） | 引擎运行时（静态链入 .so，不含独立二进制） | MIT / Apache-2.0 WITH LLVM-exception | https://www.rust-lang.org · https://llvm.org/LICENSE.txt |
 
-VERA20K™ 是 Halvor Nikolai Rusten 的商标。HRA20K 是社区修改版，不是 VERA20K 官方版本，与其权利人无隶属关系。《红色警戒2：尤里的复仇》及其游戏文件版权归 Electronic Arts 所有，本项目与 Electronic Arts 无关联。
+VERA20K™ 是 Halvor Nikolai Rusten 的商标。HRA20K 是社区修改版，不是 VERA20K 官方版本，与其权利人无隶属关系。《命令与征服》与《红色警戒》是 Electronic Arts Inc. 的商标；《红色警戒2：尤里的复仇》及其游戏文件版权归 Electronic Arts 所有。程序图标与截图使用《红色警戒2》的红星等游戏美术，归 Electronic Arts 所有；HRA20K 与 Electronic Arts 无隶属关系，也未获其认可或授权。
 
 ## 作者
 

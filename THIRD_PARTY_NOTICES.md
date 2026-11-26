@@ -48,6 +48,8 @@ HRA20K 以 GNU GPL v3 发布，全文见 [LICENSE](LICENSE)。应用内启动画
 
 VERA20K 与 HRA20K 均不包含《红色警戒2：尤里的复仇》的任何游戏文件。游戏文件版权归 Electronic Arts 所有，本项目的许可不覆盖它们；请自备正版游戏文件。
 
+程序图标（《红色警戒2》的红星）与宣传截图展示的是 Electronic Arts 所有的游戏美术，本项目的许可同样不覆盖它们。HRA20K 与 Electronic Arts 无隶属关系，也未获其认可或授权。
+
 ## 完整文本位置
 
 - GNU GPL v3：`vera20k-main/LICENSE-GPL`（应用内 `rawfile/licenses/LICENSE-GPL`）
